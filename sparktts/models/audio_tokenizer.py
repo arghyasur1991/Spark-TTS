@@ -36,7 +36,15 @@ class BiCodecTokenizer:
             model_dir: Path to the model directory.
             device: Device to run the model on (default is GPU if available).
         """
-        self.device = device
+        self.original_device = device
+        
+        # For MPS devices, we'll use CPU for the model to avoid unsupported operations
+        if device is not None and device.type == "mps":
+            print("MPS device detected - using CPU for BiCodec model to avoid unsupported operations")
+            self.device = torch.device("cpu")
+        else:
+            self.device = device
+            
         self.model_dir = model_dir
         self.config = load_config(f"{model_dir}/config.yaml")
         self._initialize_model()
@@ -49,6 +57,8 @@ class BiCodecTokenizer:
         self.processor = Wav2Vec2FeatureExtractor.from_pretrained(
             f"{self.model_dir}/wav2vec2-large-xlsr-53"
         )
+        
+        # Load feature extractor on the same device as the model
         self.feature_extractor = Wav2Vec2Model.from_pretrained(
             f"{self.model_dir}/wav2vec2-large-xlsr-53"
         ).to(self.device)
@@ -91,7 +101,12 @@ class BiCodecTokenizer:
             padding=True,
             output_hidden_states=True,
         ).input_values
-        feat = self.feature_extractor(inputs.to(self.feature_extractor.device))
+        
+        # Process on the model's device (which is CPU if MPS was detected)
+        inputs = inputs.to(self.device)
+        feat = self.feature_extractor(inputs)
+        
+        # Calculate mixed features
         feats_mix = (
             feat.hidden_states[11] + feat.hidden_states[14] + feat.hidden_states[16]
         ) / 3
@@ -120,12 +135,21 @@ class BiCodecTokenizer:
         """tokenize the audio"""
         wav, ref_wav = self.process_audio(audio_path)
         feat = self.extract_wav2vec2_features(wav)
+        
+        # Move data to model's device (CPU if MPS was detected in __init__)
         batch = {
             "wav": torch.from_numpy(wav).unsqueeze(0).float().to(self.device),
             "ref_wav": ref_wav.to(self.device),
             "feat": feat.to(self.device),
         }
+        
         semantic_tokens, global_tokens = self.model.tokenize(batch)
+        
+        # If original device was MPS, but we're using CPU for the model, 
+        # we need to move outputs back to MPS for downstream processing
+        if self.original_device is not None and self.original_device.type == "mps" and self.device.type == "cpu":
+            semantic_tokens = semantic_tokens.to(self.original_device)
+            global_tokens = global_tokens.to(self.original_device)
 
         return global_tokens, semantic_tokens
 
@@ -141,8 +165,15 @@ class BiCodecTokenizer:
         Returns:
             wav_rec: waveform. shape: (batch_size, seq_len) for batch or (seq_len,) for single
         """
+        # If we're using MPS, but model is on CPU, move inputs to CPU
+        if self.original_device is not None and self.original_device.type == "mps" and self.device.type == "cpu":
+            global_tokens = global_tokens.to(self.device)
+            semantic_tokens = semantic_tokens.to(self.device)
+            
         global_tokens = global_tokens.unsqueeze(1)
         wav_rec = self.model.detokenize(semantic_tokens, global_tokens)
+        
+        # Always return as numpy array from CPU
         return wav_rec.detach().squeeze().cpu().numpy()
 
 

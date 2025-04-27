@@ -80,6 +80,12 @@ class BiCodec(nn.Module):
         ckpt_path = f'{model_dir}/model.safetensors'
         config = load_config(f'{model_dir}/config.yaml')['audio_tokenizer']
         mel_params = config["mel_params"]
+        
+        # Get the device, if it's MPS we need special handling
+        device = kwargs.get('device', None)
+        using_mps = device is not None and device.type == 'mps'
+        
+        # Initialize models (on CPU if using MPS to avoid unsupported ops)
         encoder = Encoder(**config["encoder"])
         quantizer = FactorizedVectorQuantize(**config["quantizer"])
         prenet = Decoder(**config["prenet"])
@@ -180,11 +186,35 @@ class BiCodec(nn.Module):
         Returns:
             tensor: Reconstructed waveform.
         """
-        z_q = self.quantizer.detokenize(semantic_tokens)
-        d_vector = self.speaker_encoder.detokenize(global_tokens)
-        x = self.prenet(z_q, d_vector)
-        x = x + d_vector.unsqueeze(-1)
-        wav_recon = self.decoder(x)
+        device = semantic_tokens.device
+        
+        # Check if we're using MPS - if yes, use CPU for these operations
+        if device.type == "mps":
+            cpu_device = torch.device("cpu")
+            semantic_tokens_cpu = semantic_tokens.to(cpu_device)
+            global_tokens_cpu = global_tokens.to(cpu_device)
+            
+            z_q = self.quantizer.detokenize(semantic_tokens_cpu)
+            d_vector = self.speaker_encoder.detokenize(global_tokens_cpu)
+            x = self.prenet(z_q, d_vector)
+            x = x + d_vector.unsqueeze(-1)
+            
+            # Move decoder to CPU temporarily
+            decoder_cpu = self.decoder.to(cpu_device)
+            wav_recon = decoder_cpu(x)
+            
+            # Move decoder back
+            self.decoder = self.decoder.to(device)
+            
+            # Move result back to original device
+            wav_recon = wav_recon.to(device)
+        else:
+            # Original flow for non-MPS devices
+            z_q = self.quantizer.detokenize(semantic_tokens)
+            d_vector = self.speaker_encoder.detokenize(global_tokens)
+            x = self.prenet(z_q, d_vector)
+            x = x + d_vector.unsqueeze(-1)
+            wav_recon = self.decoder(x)
 
         return wav_recon
 

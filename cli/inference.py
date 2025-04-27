@@ -13,8 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+# Set MPS fallback for operations not supported by MPS
+# This addresses the "Output channels > 65536 not supported at the MPS device" error
+# that occurs with wav2vec2 models on Apple Silicon (M1/M2/M3) hardware
 import os
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
 import argparse
 import torch
 import soundfile as sf
@@ -72,7 +76,8 @@ def run_tts(args):
     # Convert device argument to torch.device
     if platform.system() == "Darwin" and torch.backends.mps.is_available():
         # macOS with MPS support (Apple Silicon)
-        device = torch.device("cpu") # torch.device(f"mps:{args.device}")
+        logging.info("MPS fallback to CPU enabled for unsupported operations")
+        device = torch.device(f"mps:{args.device}")
         logging.info(f"Using MPS device: {device}")
     elif torch.cuda.is_available():
         # System with CUDA support

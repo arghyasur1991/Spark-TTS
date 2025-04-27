@@ -27,7 +27,8 @@ device=0
 save_dir='example/results'
 model_dir="pretrained_models/Spark-TTS-0.5B"
 prompt_text="Very well. Now that we've dispensed with introductions – which I assure you were not high on my list of priorities – do you have a *point*? Or are you simply cataloging the names of everyone present? Because unless your name is somehow pertinent to the sudden demise of Lord Ashworth, I suggest you move on to something that *is*."
-text="Did you not *just* state it? 'Arghya', was it? Yes, I heard you. I acknowledged it. Is there some reason you require this fact reiterated? Or are we quite finished with pointless exercises and ready to discuss something pertinent to *why* we are all trapped in this house with a dead man? "
+text="Did you not *just* state it? 'Arghya', was it? Yes, I heard you. I acknowledged it."
+# text="Did you not *just* state it? 'Arghya', was it? Yes, I heard you. I acknowledged it. Is there some reason you require this fact reiterated? Or are we quite finished with pointless exercises and ready to discuss something pertinent to *why* we are all trapped in this house with a dead man? "
 prompt_speech_path="example/results/prompt.wav"
 
 # Change directory to the root directory
