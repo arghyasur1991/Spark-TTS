@@ -72,7 +72,7 @@ def run_tts(args):
     # Convert device argument to torch.device
     if platform.system() == "Darwin" and torch.backends.mps.is_available():
         # macOS with MPS support (Apple Silicon)
-        device = torch.device(f"mps:{args.device}")
+        device = torch.device("cpu") # torch.device(f"mps:{args.device}")
         logging.info(f"Using MPS device: {device}")
     elif torch.cuda.is_available():
         # System with CUDA support
