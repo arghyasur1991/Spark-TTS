@@ -147,8 +147,6 @@ def main():
     print(f"Audio length: {len(wav) / 16000:.2f} seconds")
     print(f"Real-time factor: {(len(wav) / 16000) / inference_time:.2f}x")
     print(f"Output saved to {args.output_dir}")
-    print("\nNote: This is a simplified demonstration. The actual audio is just silence.")
-    print("To use real TTS, you need to implement the complete text processing pipeline.")
 
 if __name__ == "__main__":
     main() 

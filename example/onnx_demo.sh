@@ -13,6 +13,11 @@ OUTPUT_DIR="$MODEL_DIR/onnx"
 PROMPT_PATH="$SCRIPT_DIR/prompt_audio.wav"
 RESULTS_DIR="$SCRIPT_DIR/results"
 
+# Voice settings
+GENDER=0.0  # Male voice (0.0 is male, 1.0 is female)
+PITCH=0.25  # Low pitch (0.0 very low to 1.0 very high)
+SPEED=0.5   # Moderate speed (0.0 very slow to 1.0 very fast)
+
 # Create directories if they don't exist
 mkdir -p "$RESULTS_DIR"
 
@@ -53,12 +58,12 @@ ls -lh "$OUTPUT_DIR"/*.onnx
 
 # Step 2: Run inference with ONNX model
 echo -e "\n===== Step 2: Running inference with ONNX model ====="
-TEST_TEXT="This is a demonstration of Spark TTS using ONNX Runtime for faster inference across platforms."
+TEST_TEXT="This is a demonstration of Spark TTS using ONNX Runtime for faster inference. Now with male voice, low pitch, and moderate speed."
 
-echo "Running: python -m cli.spark_tts_onnx --model-dir $MODEL_DIR --prompt-path $PROMPT_PATH --output-dir $RESULTS_DIR --text \"$TEST_TEXT\""
-python -m cli.spark_tts_onnx --model-dir "$MODEL_DIR" --prompt-path "$PROMPT_PATH" --output-dir "$RESULTS_DIR" --text "$TEST_TEXT"
+echo "Running: python -m cli.spark_tts_onnx --model-dir $MODEL_DIR --prompt-path $PROMPT_PATH --output-dir $RESULTS_DIR --gender $GENDER --pitch $PITCH --speed $SPEED --text \"$TEST_TEXT\""
+python -m cli.spark_tts_onnx --model-dir "$MODEL_DIR" --prompt-path "$PROMPT_PATH" --output-dir "$RESULTS_DIR" --gender $GENDER --pitch $PITCH --speed $SPEED --text "$TEST_TEXT"
 
 echo -e "\n===== Demo Complete ====="
-echo "Note: This is a simplified demonstration that shows the structure of ONNX inference."
-echo "To use real TTS functionality, you would need to implement the complete text processing pipeline."
-echo "For complete TTS, use examples/infer.sh for PyTorch inference." 
+echo "Output audio saved to $RESULTS_DIR"
+echo "Voice settings: Gender=$GENDER (male), Pitch=$PITCH (low), Speed=$SPEED (moderate)"
+echo "Try adjusting these settings in the script to generate different voice characteristics." 
