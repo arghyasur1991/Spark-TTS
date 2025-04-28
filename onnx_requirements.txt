@@ -1,0 +1,12 @@
+numpy==2.2.3
+torch==2.5.1
+# Use pre-built wheel to avoid cmake issues with Python 3.12
+onnx>=1.15.0
+# Choose one of the following based on your platform:
+onnxruntime>=1.17.0  # Recent versions support CPU, CUDA (with -gpu variant) and Apple Silicon
+# onnxruntime-gpu>=1.17.0  # For systems with NVIDIA GPUs (if needed)
+safetensors==0.5.2
+omegaconf==2.3.0
+
+# Note: When installing, use:
+# pip install -r onnx_requirements.txt --no-build-isolation 

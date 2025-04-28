@@ -1,0 +1,10 @@
+Collecting onnx
+  Using cached onnx-1.17.0-cp312-cp312-macosx_12_0_universal2.whl.metadata (16 kB)
+Requirement already satisfied: numpy>=1.20 in /Users/sur/miniconda3/lib/python3.12/site-packages (from onnx) (2.2.3)
+Collecting protobuf>=3.20.2 (from onnx)
+  Using cached protobuf-6.30.2-cp39-abi3-macosx_10_9_universal2.whl.metadata (593 bytes)
+Using cached onnx-1.17.0-cp312-cp312-macosx_12_0_universal2.whl (16.7 MB)
+Using cached protobuf-6.30.2-cp39-abi3-macosx_10_9_universal2.whl (417 kB)
+Installing collected packages: protobuf, onnx
+
+Successfully installed onnx-1.17.0 protobuf-6.30.2
