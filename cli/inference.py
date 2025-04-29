@@ -89,6 +89,43 @@ def parse_args():
         action="store_true", 
         help="Use optimized flow with tokenization reuse"
     )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        choices=["none", "fp16", "int8"],
+        default="none",
+        help="Model quantization method (none, fp16, or int8)",
+    )
+    parser.add_argument(
+        "--max_new_tokens",
+        type=int,
+        default=3000,
+        help="Maximum number of new tokens to generate",
+    )
+    parser.add_argument(
+        "--do_sample",
+        action="store_true",
+        default=True,
+        help="Whether to use sampling for generation",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.8,
+        help="Sampling temperature (higher = more random)",
+    )
+    parser.add_argument(
+        "--top_k",
+        type=int,
+        default=50,
+        help="Top-k sampling parameter",
+    )
+    parser.add_argument(
+        "--top_p",
+        type=float,
+        default=0.95,
+        help="Top-p (nucleus) sampling parameter",
+    )
     return parser.parse_args()
 
 
@@ -116,7 +153,11 @@ def run_tts(args):
         logging.info("GPU acceleration not available, using CPU")
 
     # Initialize the model
-    model = SparkTTS(args.model_dir, device)
+    model = SparkTTS(
+        args.model_dir, 
+        device,
+        quantization=args.quantization if args.quantization != "none" else None
+    )
 
     # Run benchmark if requested
     if args.benchmark:
@@ -151,6 +192,11 @@ def run_tts(args):
         wav, model_inputs, global_token_ids = model.inference(
             model_inputs=model_inputs,
             global_token_ids=global_token_ids,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            max_new_tokens=args.max_new_tokens,
+            do_sample=args.do_sample,
         )
         
         # Save first sentence
@@ -176,6 +222,11 @@ def run_tts(args):
             wav, model_inputs, _ = model.inference(
                 model_inputs=updated_inputs,
                 global_token_ids=global_token_ids,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                max_new_tokens=args.max_new_tokens,
+                do_sample=args.do_sample,
             )
             
             # Save subsequent sentences
@@ -194,6 +245,11 @@ def run_tts(args):
                 gender=args.gender,
                 pitch=args.pitch,
                 speed=args.speed,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                max_new_tokens=args.max_new_tokens,
+                do_sample=args.do_sample,
             )[0]  # Extract wav from tuple
             sf.write(save_path, wav, samplerate=16000)
 

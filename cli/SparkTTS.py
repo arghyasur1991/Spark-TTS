@@ -16,7 +16,7 @@
 import re
 import torch
 import time
-from typing import Tuple, Dict
+from typing import Tuple, Dict, Optional, Literal
 from pathlib import Path
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -30,25 +30,67 @@ class SparkTTS:
     Spark-TTS for text-to-speech generation.
     """
 
-    def __init__(self, model_dir: Path, device: torch.device = torch.device("cuda:0")):
+    def __init__(
+        self, 
+        model_dir: Path, 
+        device: torch.device = torch.device("cuda:0"),
+        quantization: Optional[Literal["int8", "fp16", "none"]] = None,
+    ):
         """
         Initializes the SparkTTS model with the provided configurations and device.
 
         Args:
             model_dir (Path): Directory containing the model and config files.
             device (torch.device): The device (CPU/GPU) to run the model on.
+            quantization (str, optional): Quantization method to use ('int8', 'fp16', or None).
         """
         self.device = device
         self.model_dir = model_dir
         self.configs = load_config(f"{model_dir}/config.yaml")
         self.sample_rate = self.configs["sample_rate"]
+        self.quantization = quantization
         self._initialize_inference()
 
     def _initialize_inference(self):
         """Initializes the tokenizer, model, and audio tokenizer for inference."""
         self.tokenizer = AutoTokenizer.from_pretrained(f"{self.model_dir}/LLM")
-        self.model = AutoModelForCausalLM.from_pretrained(f"{self.model_dir}/LLM")
+        
+        # Load base model
+        if self.quantization == "fp16" and self.device.type in ["cuda", "mps"]:
+            # Load with FP16 precision for GPU
+            self.model = AutoModelForCausalLM.from_pretrained(
+                f"{self.model_dir}/LLM",
+                torch_dtype=torch.float16,
+            )
+        else:
+            # Load with default precision
+            self.model = AutoModelForCausalLM.from_pretrained(f"{self.model_dir}/LLM")
+        
+        # Apply quantization if requested
+        if self.quantization == "int8":
+            try:
+                # Use dynamic quantization for INT8
+                self.model = torch.quantization.quantize_dynamic(
+                    self.model, {torch.nn.Linear}, dtype=torch.qint8
+                )
+                print("Applied INT8 dynamic quantization to model")
+            except Exception as e:
+                print(f"Failed to apply INT8 quantization: {e}")
+                print("Using original model without quantization")
+                
+        # Try to use torch.compile if available (PyTorch 2.0+)
+        if hasattr(torch, 'compile') and self.device.type == "cuda":
+            try:
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+                print("Using torch.compile for model acceleration")
+            except Exception as e:
+                print(f"Failed to compile model: {e}")
+                print("Using original model without compilation")
+        
+        # Initialize audio tokenizer
         self.audio_tokenizer = BiCodecTokenizer(self.model_dir, device=self.device)
+        
+        # Move model to device
         self.model.to(self.device)
 
     def _measure_time(self, func, *args, **kwargs):
@@ -250,6 +292,8 @@ class SparkTTS:
         temperature: float = 0.8,
         top_k: float = 50,
         top_p: float = 0.95,
+        max_new_tokens: int = 3000,
+        do_sample: bool = True,
         model_inputs: torch.Tensor = None,
         global_token_ids: torch.Tensor = None,
         collect_timing: bool = False,
@@ -267,6 +311,8 @@ class SparkTTS:
             temperature (float, optional): Sampling temperature for controlling randomness. Default is 0.8.
             top_k (float, optional): Top-k sampling parameter. Default is 50.
             top_p (float, optional): Top-p (nucleus) sampling parameter. Default is 0.95.
+            max_new_tokens (int, optional): Maximum number of new tokens to generate. Default is 3000.
+            do_sample (bool, optional): Whether to use sampling for generation. Default is True.
             model_inputs (torch.Tensor, optional): Pre-tokenized inputs to use instead of text.
             global_token_ids (torch.Tensor, optional): Pre-generated global token IDs.
             collect_timing (bool, optional): Whether to collect and return timing data.
@@ -298,8 +344,8 @@ class SparkTTS:
             
         generated_ids = self.model.generate(
             **model_inputs,
-            max_new_tokens=3000,
-            do_sample=True,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
             top_k=top_k,
             top_p=top_p,
             temperature=temperature,

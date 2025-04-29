@@ -14,6 +14,11 @@ PROMPT_SPEECH="example/results/prompt.wav"
 BENCHMARK_RUNS=3
 SAVE_DIR="benchmark_results"
 DEVICE=0
+QUANTIZATION="none"
+MAX_NEW_TOKENS=3000
+TEMPERATURE=0.8
+TOP_K=50
+TOP_P=0.95
 
 # Create results directory if it doesn't exist
 mkdir -p $SAVE_DIR
@@ -38,6 +43,11 @@ if [ "$1" == "-h" ] || [ "$1" == "--help" ]; then
   echo "  -r, --runs NUM       Number of benchmark runs (default: $BENCHMARK_RUNS)"
   echo "  -s, --save DIR       Directory to save results (default: $SAVE_DIR)"
   echo "  -d, --device NUM     Device ID (default: $DEVICE)"
+  echo "  -q, --quantization   Quantization method: none, fp16, int8 (default: $QUANTIZATION)"
+  echo "  -t, --temperature    Sampling temperature (default: $TEMPERATURE)"
+  echo "  -k, --top-k          Top-k sampling parameter (default: $TOP_K)"
+  echo "  -p, --top-p          Top-p sampling parameter (default: $TOP_P)"
+  echo "  -n, --tokens         Max new tokens to generate (default: $MAX_NEW_TOKENS)"
   echo "  -v, --voice          Run voice cloning benchmark"
   echo "  -c, --control        Run controlled voice benchmark"
   echo "  -a, --all            Run all benchmarks"
@@ -70,6 +80,26 @@ while [[ $# -gt 0 ]]; do
       ;;
     -d|--device)
       DEVICE="$2"
+      shift 2
+      ;;
+    -q|--quantization)
+      QUANTIZATION="$2"
+      shift 2
+      ;;
+    -t|--temperature)
+      TEMPERATURE="$2"
+      shift 2
+      ;;
+    -k|--top-k)
+      TOP_K="$2"
+      shift 2
+      ;;
+    -p|--top-p)
+      TOP_P="$2"
+      shift 2
+      ;;
+    -n|--tokens)
+      MAX_NEW_TOKENS="$2"
       shift 2
       ;;
     -v|--voice)
@@ -113,6 +143,12 @@ run_benchmark() {
   echo "  Model: $MODEL_DIR"
   echo "  Runs: $BENCHMARK_RUNS"
   echo "  Device: $DEVICE"
+  echo "  Quantization: $QUANTIZATION"
+  echo "  Generation Parameters:"
+  echo "    - Temperature: $TEMPERATURE"
+  echo "    - Top-k: $TOP_K"
+  echo "    - Top-p: $TOP_P"
+  echo "    - Max New Tokens: $MAX_NEW_TOKENS"
   echo "  Extra Args: $extra_args"
   echo ""
   
@@ -123,6 +159,11 @@ run_benchmark() {
     --device="$DEVICE" \
     --benchmark \
     --benchmark_runs="$BENCHMARK_RUNS" \
+    --quantization="$QUANTIZATION" \
+    --temperature="$TEMPERATURE" \
+    --top_k="$TOP_K" \
+    --top_p="$TOP_P" \
+    --max_new_tokens="$MAX_NEW_TOKENS" \
     --benchmark_texts \
       "This is the first sentence to synthesize." \
       "Here's the second sentence with the same voice." \

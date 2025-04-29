@@ -15,6 +15,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# ANSI color codes for better output
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
 
 # Get the absolute path of the script's directory
 script_dir=$(dirname "$(realpath "$0")")
@@ -31,10 +36,48 @@ text="Did you not *just* state it? 'Arghya', was it? Yes, I heard you. I acknowl
 # text="Did you not *just* state it? 'Arghya', was it? Yes, I heard you. I acknowledged it. Is there some reason you require this fact reiterated? Or are we quite finished with pointless exercises and ready to discuss something pertinent to *why* we are all trapped in this house with a dead man? "
 prompt_speech_path="example/results/prompt.wav"
 
+# Generation parameters
+quantization="int8"  # none, fp16, int8
+max_new_tokens=3000
+do_sample=true
+temperature=0.8
+top_k=50
+top_p=0.95
+reuse_tokenization=false
+
 # Change directory to the root directory
 cd "$root_dir" || exit
 
 source sparktts/utils/parse_options.sh
+
+# Display configuration
+echo -e "${BLUE}SparkTTS Inference${NC}"
+echo -e "${YELLOW}Configuration:${NC}"
+echo "• Model: $model_dir"
+echo "• Device: $device"
+echo "• Quantization: $quantization"
+echo "• Text: $text"
+echo "• Prompt: $prompt_speech_path"
+echo "• Generation Parameters:"
+echo "  - Max Tokens: $max_new_tokens"
+echo "  - Temperature: $temperature"
+echo "  - Top-k: $top_k"
+echo "  - Top-p: $top_p"
+echo "  - Sampling: $do_sample"
+echo "  - Reuse Tokenization: $reuse_tokenization"
+echo
+
+# Set up additional arguments
+additional_args=""
+if [ "$reuse_tokenization" = true ]; then
+  additional_args="$additional_args --reuse_tokenization"
+fi
+
+if [ "$do_sample" = true ]; then
+  additional_args="$additional_args --do_sample"
+fi
+
+echo -e "${GREEN}Starting inference...${NC}"
 
 # Run inference
 python -m cli.inference \
@@ -42,6 +85,14 @@ python -m cli.inference \
     --device "${device}" \
     --save_dir "${save_dir}" \
     --model_dir "${model_dir}" \
-    --prompt_speech_path "${prompt_speech_path}"
+    --prompt_speech_path "${prompt_speech_path}" \
+    --quantization "${quantization}" \
+    --max_new_tokens "${max_new_tokens}" \
+    --temperature "${temperature}" \
+    --top_k "${top_k}" \
+    --top_p "${top_p}" \
+    ${additional_args}
+
+echo -e "${GREEN}Inference complete! Results saved to ${save_dir}${NC}"
     
     
