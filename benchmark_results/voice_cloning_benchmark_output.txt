@@ -1,0 +1,3 @@
+MPS device detected - using CPU for BiCodec model to avoid unsupported operations
+Missing tensor: mel_transformer.spectrogram.window
+Missing tensor: mel_transformer.mel_scale.fb

@@ -25,6 +25,8 @@ import soundfile as sf
 import logging
 from datetime import datetime
 import platform
+import json
+import time
 
 from cli.SparkTTS import SparkTTS
 
@@ -47,7 +49,7 @@ def parse_args():
     )
     parser.add_argument("--device", type=int, default=0, help="CUDA device number")
     parser.add_argument(
-        "--text", type=str, required=True, help="Text for TTS generation"
+        "--text", type=str, help="Text for TTS generation"
     )
     parser.add_argument("--prompt_text", type=str, help="Transcript of prompt audio")
     parser.add_argument(
@@ -61,6 +63,31 @@ def parse_args():
     )
     parser.add_argument(
         "--speed", choices=["very_low", "low", "moderate", "high", "very_high"]
+    )
+    parser.add_argument(
+        "--benchmark", 
+        action="store_true", 
+        help="Run benchmark comparing standard and optimized flows"
+    )
+    parser.add_argument(
+        "--benchmark_texts", 
+        type=str, 
+        nargs="+", 
+        default=["This is the first sentence to synthesize.",
+                "Here's another sentence with the same voice.",
+                "And one more with the same voice characteristics."],
+        help="List of texts to use for benchmarking"
+    )
+    parser.add_argument(
+        "--benchmark_runs", 
+        type=int, 
+        default=3, 
+        help="Number of benchmark runs to average"
+    )
+    parser.add_argument(
+        "--reuse_tokenization", 
+        action="store_true", 
+        help="Use optimized flow with tokenization reuse"
     )
     return parser.parse_args()
 
@@ -91,25 +118,157 @@ def run_tts(args):
     # Initialize the model
     model = SparkTTS(args.model_dir, device)
 
+    # Run benchmark if requested
+    if args.benchmark:
+        run_benchmark(model, args)
+        return
+
     # Generate unique filename using timestamp
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     save_path = os.path.join(args.save_dir, f"{timestamp}.wav")
 
     logging.info("Starting inference...")
 
-    # Perform inference and save the output audio
-    with torch.no_grad():
-        wav = model.inference(
-            args.text,
-            args.prompt_speech_path,
+    # Check if we should use the optimized flow
+    if args.reuse_tokenization and args.text and len(args.text.split(".")) > 1:
+        # For demonstration, split the text into sentences
+        sentences = [s.strip() + "." for s in args.text.split(".") if s.strip()]
+        
+        logging.info(f"Using optimized flow with {len(sentences)} sentences")
+        
+        # Initial tokenization
+        start_time = time.time()
+        model_inputs, global_token_ids = model.tokenize_inputs(
+            text=sentences[0],
+            prompt_speech_path=args.prompt_speech_path,
             prompt_text=args.prompt_text,
             gender=args.gender,
             pitch=args.pitch,
             speed=args.speed,
         )
+        
+        # Process first sentence
+        wav, model_inputs, global_token_ids = model.inference(
+            model_inputs=model_inputs,
+            global_token_ids=global_token_ids,
+        )
+        
+        # Save first sentence
         sf.write(save_path, wav, samplerate=16000)
+        logging.info(f"First sentence audio saved at: {save_path}")
+        
+        # Process remaining sentences
+        for i, sentence in enumerate(sentences[1:], 1):
+            sentence_start = time.time()
+            
+            # Update text in existing tokenized inputs
+            is_control_mode = args.gender is not None
+            if is_control_mode:
+                updated_inputs = model.update_text_in_tokenized_inputs(
+                    model_inputs, sentence, True, args.gender, args.pitch, args.speed
+                )
+            else:
+                updated_inputs = model.update_text_in_tokenized_inputs(
+                    model_inputs, sentence
+                )
+            
+            # Generate with updated inputs
+            wav, model_inputs, _ = model.inference(
+                model_inputs=updated_inputs,
+                global_token_ids=global_token_ids,
+            )
+            
+            # Save subsequent sentences
+            next_save_path = os.path.join(args.save_dir, f"{timestamp}_sentence_{i}.wav")
+            sf.write(next_save_path, wav, samplerate=16000)
+            logging.info(f"Sentence {i+1} audio saved at: {next_save_path} (took {time.time() - sentence_start:.2f}s)")
+        
+        logging.info(f"Total time for optimized flow: {time.time() - start_time:.2f}s")
+    else:
+        # Perform standard inference and save the output audio
+        with torch.no_grad():
+            wav = model.inference(
+                args.text,
+                args.prompt_speech_path,
+                prompt_text=args.prompt_text,
+                gender=args.gender,
+                pitch=args.pitch,
+                speed=args.speed,
+            )[0]  # Extract wav from tuple
+            sf.write(save_path, wav, samplerate=16000)
 
-    logging.info(f"Audio saved at: {save_path}")
+        logging.info(f"Audio saved at: {save_path}")
+
+
+def run_benchmark(model, args):
+    """Run benchmark comparing standard and optimized flows."""
+    logging.info("Running benchmark...")
+    logging.info(f"Number of texts: {len(args.benchmark_texts)}")
+    logging.info(f"Number of runs: {args.benchmark_runs}")
+    
+    # Run benchmark
+    results = model.benchmark_performance(
+        text_list=args.benchmark_texts,
+        prompt_speech_path=args.prompt_speech_path,
+        prompt_text=args.prompt_text,
+        gender=args.gender,
+        pitch=args.pitch,
+        speed=args.speed,
+        num_runs=args.benchmark_runs,
+    )
+    
+    # Save benchmark results
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    results_file = os.path.join(args.save_dir, f"benchmark_results_{timestamp}.json")
+    with open(results_file, 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    # Display results
+    logging.info("\n=== BENCHMARK RESULTS ===")
+    logging.info(f"Standard flow total time: {results['standard_flow']['total_time']:.2f}s")
+    logging.info(f"Optimized flow total time: {results['optimized_flow']['total_time']:.2f}s")
+    logging.info(f"Speedup factor: {results['speedup_factor']:.2f}x")
+    logging.info(f"Initial tokenization overhead: {results['first_utterance_overhead']:.2f}s")
+    logging.info(f"Subsequent utterance speedup: {results['subsequent_utterance_speedup']:.2f}x")
+    
+    # Display operation timing analysis
+    logging.info("\n=== OPERATION TIMING ANALYSIS ===")
+    
+    # Standard flow analysis
+    std_analysis = results['operation_analysis']['standard_flow']
+    if std_analysis:
+        logging.info("Standard Flow Breakdown:")
+        for op_name in sorted(
+            [k for k in std_analysis.keys() if not k.endswith('_percent') 
+             and k not in ['total_time', 'heaviest_operation', 'heaviest_operation_time', 'heaviest_operation_percent']],
+            key=lambda x: std_analysis[x],
+            reverse=True
+        ):
+            if op_name.endswith('_time'):
+                op_display = op_name.replace('_time', '')
+                logging.info(f"  {op_display:20s}: {std_analysis[op_name]:.2f}s ({std_analysis[op_name+'_percent']:.1f}%)")
+        
+        logging.info(f"  Heaviest operation: {std_analysis['heaviest_operation'].replace('_time', '')} "
+                    f"({std_analysis['heaviest_operation_percent']:.1f}% of total time)")
+    
+    # Optimized flow analysis
+    opt_analysis = results['operation_analysis']['optimized_flow']
+    if opt_analysis:
+        logging.info("\nOptimized Flow Breakdown:")
+        for op_name in sorted(
+            [k for k in opt_analysis.keys() if not k.endswith('_percent') 
+             and k not in ['total_time', 'heaviest_operation', 'heaviest_operation_time', 'heaviest_operation_percent']],
+            key=lambda x: opt_analysis[x],
+            reverse=True
+        ):
+            if op_name.endswith('_time'):
+                op_display = op_name.replace('_time', '')
+                logging.info(f"  {op_display:20s}: {opt_analysis[op_name]:.2f}s ({opt_analysis[op_name+'_percent']:.1f}%)")
+        
+        logging.info(f"  Heaviest operation: {opt_analysis['heaviest_operation'].replace('_time', '')} "
+                    f"({opt_analysis['heaviest_operation_percent']:.1f}% of total time)")
+    
+    logging.info(f"Detailed results saved to: {results_file}")
 
 
 if __name__ == "__main__":
