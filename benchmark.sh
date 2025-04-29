@@ -19,6 +19,8 @@ MAX_NEW_TOKENS=3000
 TEMPERATURE=0.8
 TOP_K=50
 TOP_P=0.95
+USE_COMPILE=false
+COMPILE_MODE="reduce-overhead"
 
 # Create results directory if it doesn't exist
 mkdir -p $SAVE_DIR
@@ -48,6 +50,8 @@ if [ "$1" == "-h" ] || [ "$1" == "--help" ]; then
   echo "  -k, --top-k          Top-k sampling parameter (default: $TOP_K)"
   echo "  -p, --top-p          Top-p sampling parameter (default: $TOP_P)"
   echo "  -n, --tokens         Max new tokens to generate (default: $MAX_NEW_TOKENS)"
+  echo "  -u, --use-compile    Use torch.compile (default: $USE_COMPILE)"
+  echo "  -m, --compile-mode   Compilation mode (default: $COMPILE_MODE)"
   echo "  -v, --voice          Run voice cloning benchmark"
   echo "  -c, --control        Run controlled voice benchmark"
   echo "  -a, --all            Run all benchmarks"
@@ -102,6 +106,14 @@ while [[ $# -gt 0 ]]; do
       MAX_NEW_TOKENS="$2"
       shift 2
       ;;
+    -u|--use-compile)
+      USE_COMPILE="$2"
+      shift 2
+      ;;
+    -m|--compile-mode)
+      COMPILE_MODE="$2"
+      shift 2
+      ;;
     -v|--voice)
       VOICE_CLONE=true
       shift
@@ -149,6 +161,9 @@ run_benchmark() {
   echo "    - Top-k: $TOP_K"
   echo "    - Top-p: $TOP_P"
   echo "    - Max New Tokens: $MAX_NEW_TOKENS"
+  echo "  Acceleration:"
+  echo "    - Use torch.compile: $USE_COMPILE"
+  echo "    - Compile Mode: $COMPILE_MODE"
   echo "  Extra Args: $extra_args"
   echo ""
   
@@ -164,6 +179,8 @@ run_benchmark() {
     --top_k="$TOP_K" \
     --top_p="$TOP_P" \
     --max_new_tokens="$MAX_NEW_TOKENS" \
+    $([ "$USE_COMPILE" = true ] && echo "--use_compile") \
+    --compile_mode="$COMPILE_MODE" \
     --benchmark_texts \
       "This is the first sentence to synthesize." \
       "Here's the second sentence with the same voice." \

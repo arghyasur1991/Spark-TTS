@@ -126,6 +126,18 @@ def parse_args():
         default=0.95,
         help="Top-p (nucleus) sampling parameter",
     )
+    parser.add_argument(
+        "--use_compile",
+        action="store_true",
+        help="Use torch.compile for model acceleration (PyTorch 2.0+)"
+    )
+    parser.add_argument(
+        "--compile_mode",
+        type=str,
+        choices=["default", "reduce-overhead", "max-autotune"],
+        default="reduce-overhead",
+        help="Compilation mode for torch.compile"
+    )
     return parser.parse_args()
 
 
@@ -156,7 +168,9 @@ def run_tts(args):
     model = SparkTTS(
         args.model_dir, 
         device,
-        quantization=args.quantization if args.quantization != "none" else None
+        quantization=args.quantization if args.quantization != "none" else None,
+        use_compile=args.use_compile,
+        compile_mode=args.compile_mode
     )
 
     # Run benchmark if requested

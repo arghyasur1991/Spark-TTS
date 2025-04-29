@@ -45,6 +45,10 @@ top_k=50
 top_p=0.95
 reuse_tokenization=false
 
+# Acceleration options
+use_compile=true
+compile_mode="reduce-overhead"  # default, reduce-overhead, max-autotune
+
 # Change directory to the root directory
 cd "$root_dir" || exit
 
@@ -65,6 +69,8 @@ echo "  - Top-k: $top_k"
 echo "  - Top-p: $top_p"
 echo "  - Sampling: $do_sample"
 echo "  - Reuse Tokenization: $reuse_tokenization"
+echo "  - Use Compile: $use_compile"
+echo "  - Compile Mode: $compile_mode"
 echo
 
 # Set up additional arguments
@@ -75,6 +81,10 @@ fi
 
 if [ "$do_sample" = true ]; then
   additional_args="$additional_args --do_sample"
+fi
+
+if [ "$use_compile" = true ]; then
+  additional_args="$additional_args --use_compile"
 fi
 
 echo -e "${GREEN}Starting inference...${NC}"
@@ -91,6 +101,7 @@ python -m cli.inference \
     --temperature "${temperature}" \
     --top_k "${top_k}" \
     --top_p "${top_p}" \
+    --compile_mode "${compile_mode}" \
     ${additional_args}
 
 echo -e "${GREEN}Inference complete! Results saved to ${save_dir}${NC}"

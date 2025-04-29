@@ -35,6 +35,8 @@ class SparkTTS:
         model_dir: Path, 
         device: torch.device = torch.device("cuda:0"),
         quantization: Optional[Literal["int8", "fp16", "none"]] = None,
+        use_compile: bool = False,
+        compile_mode: str = "reduce-overhead",
     ):
         """
         Initializes the SparkTTS model with the provided configurations and device.
@@ -43,21 +45,27 @@ class SparkTTS:
             model_dir (Path): Directory containing the model and config files.
             device (torch.device): The device (CPU/GPU) to run the model on.
             quantization (str, optional): Quantization method to use ('int8', 'fp16', or None).
+            use_compile (bool, optional): Whether to use torch.compile for acceleration (PyTorch 2.0+).
+            compile_mode (str, optional): Compilation mode for torch.compile (default, reduce-overhead, max-autotune).
         """
         self.device = device
         self.model_dir = model_dir
         self.configs = load_config(f"{model_dir}/config.yaml")
         self.sample_rate = self.configs["sample_rate"]
         self.quantization = quantization
+        self.use_compile = use_compile
+        self.compile_mode = compile_mode
         self._initialize_inference()
 
     def _initialize_inference(self):
         """Initializes the tokenizer, model, and audio tokenizer for inference."""
+        print("\n==== Initializing SparkTTS Model ====")
         self.tokenizer = AutoTokenizer.from_pretrained(f"{self.model_dir}/LLM")
         
         # Load base model
         if self.quantization == "fp16" and self.device.type in ["cuda", "mps"]:
             # Load with FP16 precision for GPU
+            print("Using FP16 precision for model")
             self.model = AutoModelForCausalLM.from_pretrained(
                 f"{self.model_dir}/LLM",
                 torch_dtype=torch.float16,
@@ -70,6 +78,7 @@ class SparkTTS:
         if self.quantization == "int8":
             try:
                 # Use dynamic quantization for INT8
+                print("Applying INT8 dynamic quantization...")
                 self.model = torch.quantization.quantize_dynamic(
                     self.model, {torch.nn.Linear}, dtype=torch.qint8
                 )
@@ -77,21 +86,28 @@ class SparkTTS:
             except Exception as e:
                 print(f"Failed to apply INT8 quantization: {e}")
                 print("Using original model without quantization")
-                
-        # Try to use torch.compile if available (PyTorch 2.0+)
-        if hasattr(torch, 'compile') and self.device.type == "cuda":
-            try:
-                self.model = torch.compile(self.model, mode="reduce-overhead")
-                print("Using torch.compile for model acceleration")
-            except Exception as e:
-                print(f"Failed to compile model: {e}")
-                print("Using original model without compilation")
-        
-        # Initialize audio tokenizer
-        self.audio_tokenizer = BiCodecTokenizer(self.model_dir, device=self.device)
         
         # Move model to device
         self.model.to(self.device)
+        
+        # Apply torch.compile if requested (and available)
+        if self.use_compile:
+            if hasattr(torch, 'compile'):
+                try:
+                    print(f"Applying torch.compile with mode '{self.compile_mode}'...")
+                    # Available modes: default, reduce-overhead, max-autotune
+                    self.model = torch.compile(self.model, mode=self.compile_mode)
+                    print("✓ Model successfully compiled with torch.compile")
+                except Exception as e:
+                    print(f"✗ Failed to compile model: {e}")
+                    print("Using original model without compilation")
+            else:
+                print("✗ torch.compile not available - requires PyTorch 2.0+")
+                print("Please upgrade PyTorch to use this feature")
+        
+        # Initialize audio tokenizer
+        self.audio_tokenizer = BiCodecTokenizer(self.model_dir, device=self.device)
+        print("==== Model Initialization Complete ====\n")
 
     def _measure_time(self, func, *args, **kwargs):
         """Helper method to measure execution time of a function."""
