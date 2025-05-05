@@ -279,6 +279,7 @@ class SparkTTS:
         """
         # Decode the tokenized inputs back to text
         prompt = self.tokenizer.decode(model_inputs.input_ids[0], skip_special_tokens=False)
+        # print(prompt)
         
         # Replace the text between content markers
         if is_control_mode:

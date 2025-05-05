@@ -37,7 +37,7 @@ text="Did you not *just* state it? 'Arghya', was it? Yes, I heard you. I acknowl
 prompt_speech_path="example/results/prompt.wav"
 
 # Generation parameters
-quantization="int8"  # none, fp16, int8
+quantization="none"  # none, fp16, int8
 max_new_tokens=3000
 do_sample=true
 temperature=0.8
