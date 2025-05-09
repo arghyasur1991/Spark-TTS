@@ -35,9 +35,9 @@ class ONNXSparkTTSPredictor:
     
     def __init__(
         self,
-        onnx_model_dir: Path,
-        llm_tokenizer_dir: Path,
-        bicodec_config_path: Optional[Path] = None,
+        onnx_model_dir: Union[str, Path],
+        llm_tokenizer_dir: Union[str, Path],
+        bicodec_config: Optional[Union[str, Path]] = None,
         device: str = "cpu",
     ):
         """
@@ -46,10 +46,22 @@ class ONNXSparkTTSPredictor:
         Args:
             onnx_model_dir: Path to directory containing exported ONNX models
             llm_tokenizer_dir: Path to the directory containing the tokenizer files for the LLM
-            bicodec_config_path: Path to BiCodec config.yaml (optional)
+            bicodec_config: Path to BiCodec config.yaml (optional)
             device: Device to run inference on ("cpu" or "cuda")
         """
-        self.model_dir = onnx_model_dir
+        self.onnx_model_dir = Path(onnx_model_dir)
+        self.llm_tokenizer_dir = Path(llm_tokenizer_dir)
+        
+        # Check if LLM subdirectory exists and use it for tokenizer if present
+        if (self.llm_tokenizer_dir / "LLM").exists():
+            tokenizer_path = self.llm_tokenizer_dir / "LLM"
+            print(f"Found LLM subdirectory in tokenizer path. Using: {tokenizer_path}")
+        else:
+            tokenizer_path = self.llm_tokenizer_dir
+            
+        self.tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_path))
+        
+        # Set device
         self.device = device
         
         # Define token constants
@@ -74,26 +86,23 @@ class ONNXSparkTTSPredictor:
             self.providers = ['CPUExecutionProvider']
         
         # Initialize configs
-        self._load_config(bicodec_config_path)
-        
-        # Initialize tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(str(llm_tokenizer_dir))
+        self._load_config(bicodec_config)
         
         # Load ONNX models
         self.load_models()
         
         print(f"ONNX SparkTTS initialized with {len(self.onnx_sessions)} ONNX models loaded")
     
-    def _load_config(self, bicodec_config_path: Optional[Path] = None):
+    def _load_config(self, bicodec_config: Optional[Union[str, Path]] = None):
         """Load configuration from provided path or try to find it."""
         # Default values
         self.sample_rate = 16000  # Default sample rate
         
-        if bicodec_config_path and bicodec_config_path.exists():
+        if bicodec_config and isinstance(bicodec_config, (str, Path)) and Path(bicodec_config).exists():
             try:
-                with open(bicodec_config_path, 'r') as f:
+                with open(bicodec_config, 'r') as f:
                     self.config = yaml.safe_load(f)
-                print(f"Loaded BiCodec config from {bicodec_config_path}")
+                print(f"Loaded BiCodec config from {bicodec_config}")
                 
                 # Extract sample rate if available
                 if 'sample_rate' in self.config:
@@ -123,7 +132,7 @@ class ONNXSparkTTSPredictor:
         ]
         
         for component in component_names:
-            onnx_path = self.model_dir / f"{component}.onnx"
+            onnx_path = self.onnx_model_dir / f"{component}.onnx"
             if onnx_path.exists():
                 try:
                     session = ort.InferenceSession(
@@ -289,6 +298,10 @@ class ONNXSparkTTSPredictor:
             semantic_token_ids = semantic_token_ids.numpy()
         
         # 1. Convert semantic tokens to z_q using factorized_vq_detokenize
+        if "bicodec_factorized_vq_detokenize" not in self.onnx_sessions:
+            print("Error: bicodec_factorized_vq_detokenize model not found")
+            return None
+            
         fqv_detok_result = self._run_onnx("bicodec_factorized_vq_detokenize", 
                                           {"semantic_tokens": semantic_token_ids})
         if not fqv_detok_result:
@@ -302,28 +315,47 @@ class ONNXSparkTTSPredictor:
         # When using the dummy implementation, this may return an empty tensor or fail
         d_vector = None
         try:
-            spk_detok_result = self._run_onnx("bicodec_speaker_encoder_detokenize", 
-                                             {"global_tokens_indices": global_token_ids})
-            if spk_detok_result:
-                d_vector = spk_detok_result[0]
-                print(f"d_vector shape: {d_vector.shape}")
+            if "bicodec_speaker_encoder_detokenize" in self.onnx_sessions:
+                spk_detok_result = self._run_onnx("bicodec_speaker_encoder_detokenize", 
+                                                 {"global_tokens_indices": global_token_ids})
+                if spk_detok_result:
+                    d_vector = spk_detok_result[0]
+                    print(f"d_vector shape: {d_vector.shape}")
+                else:
+                    print("Failed to run speaker_encoder_detokenize, using dummy d_vector")
             else:
-                print("Failed to run speaker_encoder_detokenize, using dummy d_vector")
+                print("bicodec_speaker_encoder_detokenize model not found, using dummy d_vector")
         except Exception as e:
             print(f"Error in speaker_encoder_detokenize: {e}")
         
         # If d_vector failed or isn't usable, create a dummy one
         if d_vector is None or d_vector.size == 0:
-            d_vector = np.zeros((1, 256), dtype=np.float32)
-            print("Using zero-initialized d_vector with shape (1, 256)")
+            d_vector = np.zeros((semantic_token_ids.shape[0], 256), dtype=np.float32)
+            print(f"Using zero-initialized d_vector with shape {d_vector.shape}")
         
-        # 3. Since we don't have prenet in ONNX, we'll need to adapt the output
-        # For simplicity, pass z_q directly to the wavegenerator
-        # The expected shape is (batch_size, channels, sequence_length)
-        # Normally, prenet would do: output = prenet(z_q, d_vector)
+        # 3. Check if we have prenet and run it if available
+        prenet_output = None
+        if "bicodec_prenet" in self.onnx_sessions:
+            try:
+                prenet_result = self._run_onnx("bicodec_prenet", 
+                                              {"z_q": z_q, "d_vector": d_vector})
+                if prenet_result:
+                    prenet_output = prenet_result[0]
+                    print(f"Prenet output shape: {prenet_output.shape}")
+                else:
+                    print("Failed to run prenet, will use z_q directly")
+            except Exception as e:
+                print(f"Error in prenet: {e}")
+        else:
+            print("bicodec_prenet model not found, will use z_q directly")
         
-        # 4. Generate waveform using wavegenerator
-        wavegen_result = self._run_onnx("bicodec_wavegenerator", {"wavegen_input": z_q})
+        # 4. Generate waveform using wavegenerator with either prenet output or z_q
+        if "bicodec_wavegenerator" not in self.onnx_sessions:
+            print("Error: bicodec_wavegenerator model not found")
+            return None
+            
+        wavegen_input = prenet_output if prenet_output is not None else z_q
+        wavegen_result = self._run_onnx("bicodec_wavegenerator", {"wavegen_input": wavegen_input})
         if not wavegen_result:
             print("Failed to run wavegenerator")
             return None
