@@ -53,6 +53,18 @@ def calculate_snr(signal: np.ndarray, noise: np.ndarray) -> float:
         return float('inf') if noise_power == 0 and signal_power > 0 else 0.0
     return 10 * np.log10(signal_power / noise_power)
 
+def pad_or_truncate_to_match(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """Pad or truncate source array to match target array length."""
+    if len(source) > len(target):
+        return source[:len(target)]  # Truncate
+    elif len(source) < len(target):
+        # Create a new array initialized with zeros, with the same shape as target
+        result = np.zeros_like(target)
+        # Copy source values
+        result[:len(source)] = source
+        return result
+    return source  # Already the same length
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Compare PyTorch SparkTTS with ONNX SparkTTS inference.")
@@ -126,8 +138,16 @@ if __name__ == '__main__':
             )
         
         if wav_pytorch_tensor is not None:
-            wav_pytorch_np = wav_pytorch_tensor.cpu().numpy().squeeze()
-            torchaudio.save(args.output_pytorch_wav, torch.from_numpy(wav_pytorch_np).unsqueeze(0), pytorch_sample_rate)
+            # Check if the result is already a numpy array or a torch tensor
+            if isinstance(wav_pytorch_tensor, np.ndarray):
+                wav_pytorch_np = wav_pytorch_tensor.squeeze()
+                torch_tensor = torch.from_numpy(wav_pytorch_np).unsqueeze(0)
+            else:
+                # It's a torch tensor
+                torch_tensor = wav_pytorch_tensor
+                wav_pytorch_np = wav_pytorch_tensor.cpu().numpy().squeeze()
+            
+            torchaudio.save(args.output_pytorch_wav, torch_tensor, pytorch_sample_rate)
             print(f"PyTorch audio saved to {args.output_pytorch_wav} (Length: {len(wav_pytorch_np)})")
 
     except Exception as e:
@@ -205,8 +225,23 @@ if __name__ == '__main__':
         mse = calculate_mse(wav_pytorch_np, wav_onnx_np)
         print(f"Mean Squared Error (MSE) between waveforms: {mse:.6e}")
 
-        noise_signal = wav_pytorch_np - wav_onnx_np
-        snr = calculate_snr(wav_pytorch_np, noise_signal)
+        len_diff = abs(len(wav_pytorch_np) - len(wav_onnx_np))
+        print(f"Length: PyTorch: {len(wav_pytorch_np)}, ONNX: {len(wav_onnx_np)} (Difference: {len_diff})")
+        
+        # For SNR calculation, make sure the arrays have the same length
+        if len(wav_pytorch_np) != len(wav_onnx_np):
+            # Extract the min length for consistent comparison
+            min_len = min(len(wav_pytorch_np), len(wav_onnx_np))
+            truncated_pytorch = wav_pytorch_np[:min_len]
+            truncated_onnx = wav_onnx_np[:min_len]
+            noise_signal = truncated_pytorch - truncated_onnx
+            print("Note: Waveform lengths differ, comparison was done on the shorter segment.")
+            if len_diff > 0.1 * max(len(wav_pytorch_np), len(wav_onnx_np)): # If diff > 10%
+                print("Warning: Significant length difference detected. This might indicate issues in EOS handling or max_tokens.")
+        else:
+            noise_signal = wav_pytorch_np - wav_onnx_np
+            
+        snr = calculate_snr(wav_pytorch_np[:min_len], noise_signal)
         print(f"Signal-to-Noise Ratio (SNR) (PyTorch as signal, Diff as noise): {snr:.2f} dB")
 
         if mse < 1e-5: 
@@ -215,13 +250,6 @@ if __name__ == '__main__':
             print("Result: Outputs are reasonably close (MSE < 1e-4).")
         else:
             print("Result: Outputs have noticeable differences (MSE >= 1e-4).")
-        
-        len_diff = abs(len(wav_pytorch_np) - len(wav_onnx_np))
-        print(f"Length: PyTorch: {len(wav_pytorch_np)}, ONNX: {len(wav_onnx_np)} (Difference: {len_diff})")
-        if len_diff > 0:
-            print("Note: Waveform lengths differ, comparison was done on the shorter segment.")
-            if len_diff > 0.1 * max(len(wav_pytorch_np), len(wav_onnx_np)) : # If diff > 10%
-                 print("Warning: Significant length difference detected. This might indicate issues in EOS handling or max_tokens.")
     else:
         print("Could not compare audio outputs: one or both failed to generate or produced empty audio.")
 
