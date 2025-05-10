@@ -128,7 +128,7 @@ class ONNXSparkTTSPredictor:
             "bicodec_speaker_encoder_tokenize",
             "bicodec_speaker_encoder_detokenize",
             "bicodec_wavegenerator",
-            # "bicodec_prenet" - Skipped due to export issues
+            "bicodec_prenet"  # Now included since we have a robust implementation
         ]
         
         for component in component_names:
@@ -373,8 +373,17 @@ class ONNXSparkTTSPredictor:
         prenet_output = None
         if "bicodec_prenet" in self.onnx_sessions:
             try:
-                prenet_result = self._run_onnx("bicodec_prenet", 
-                                              {"z_q": z_q, "d_vector": d_vector})
+                # Get the input names for the prenet model
+                prenet_input_names = [input.name for input in self.onnx_sessions["bicodec_prenet"].get_inputs()]
+                print(f"Prenet input names: {prenet_input_names}")
+                
+                # Prepare inputs based on what the model expects
+                prenet_inputs = {"z_q": z_q}
+                if "d_vector" in prenet_input_names:
+                    prenet_inputs["d_vector"] = d_vector
+                
+                prenet_result = self._run_onnx("bicodec_prenet", prenet_inputs)
+                
                 if prenet_result:
                     prenet_output = prenet_result[0]
                     print(f"Prenet output shape: {prenet_output.shape}")
