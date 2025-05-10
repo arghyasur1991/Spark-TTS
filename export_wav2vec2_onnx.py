@@ -29,8 +29,8 @@ def main():
     parser = argparse.ArgumentParser(description="Export Hugging Face Wav2Vec2Model to ONNX for hidden state extraction using torch.onnx.export.")
     parser.add_argument("--hf_model_path", type=str, required=True,
                         help="Path to the Hugging Face Wav2Vec2Model directory (e.g., ./pretrained_models/Spark-TTS-0.5B/wav2vec2-large-xlsr-53).")
-    parser.add_argument("--output_onnx_path", type=str, default=None, # Default to placing it inside hf_model_path
-                        help="Full path to save the exported ONNX model (e.g., ./hf_model_path/model.onnx).")
+    parser.add_argument("--output_onnx_path", type=str, default="onnx_models/wav2vec2_model.onnx",
+                        help="Full path to save the exported ONNX model (default: onnx_models/wav2vec2_model.onnx).")
     parser.add_argument("--opset_version", type=int, default=14, help="ONNX opset version.")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for dummy input.")
     parser.add_argument("--sequence_length", type=int, default=16000, 
@@ -39,8 +39,12 @@ def main():
     args = parser.parse_args()
 
     if args.output_onnx_path is None:
-        args.output_onnx_path = os.path.join(args.hf_model_path, "model.onnx")
-        print(f"Output ONNX path not specified, defaulting to: {args.output_onnx_path}")
+        # This block might be redundant now if default is set, but keeping for safety
+        # or if user explicitly passes None (though argparse usually handles defaults).
+        # Decided to remove this as the default is now set in add_argument.
+        # args.output_onnx_path = os.path.join(args.hf_model_path, "model.onnx")
+        # print(f"Output ONNX path not specified, defaulting to: {args.output_onnx_path}")
+        pass # Default is handled by argparse
 
     # Clean the specific ONNX file if it exists
     if os.path.exists(args.output_onnx_path):

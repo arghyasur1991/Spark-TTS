@@ -80,7 +80,7 @@ class BiCodecTokenizer:
         )
         
         wav2vec2_model_path_hf = f"{self.model_dir}/wav2vec2-large-xlsr-53"
-        onnx_model_path_str = f"{wav2vec2_model_path_hf}/model.onnx"
+        onnx_model_path_str = "onnx_models/wav2vec2_model.onnx"
 
         if self.use_onnx_wav2vec2:
             if onnxruntime is None:
