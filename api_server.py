@@ -48,7 +48,26 @@ app.add_middleware(
 # Global variables
 TTS_MODEL = None
 OUTPUT_DIR = "api_outputs"
-MODEL_DIR = "pretrained_models/Spark-TTS-0.5B"
+# Read MODEL_DIR from environment variable or use default
+MODEL_DIR = os.getenv("MODEL_DIR", "pretrained_models/Spark-TTS-0.5B")
+
+# ONNX Configuration from Environment Variables (default to True for ONNX components)
+# Helper function to convert env var string to boolean, defaulting to True if var not set or invalid
+def get_bool_env_var(var_name, default_value=True):
+    value = os.getenv(var_name)
+    if value is None:
+        return default_value
+    return value.lower() in ['true', '1', 't']
+
+USE_WAV2VEC2_ONNX = get_bool_env_var("USE_WAV2VEC2_ONNX", True)
+USE_BICODEC_ONNX = get_bool_env_var("USE_BICODEC_ONNX", True)
+USE_SPEAKER_ENCODER_TOKENIZER_ONNX = get_bool_env_var("USE_SPEAKER_ENCODER_TOKENIZER_ONNX", True)
+USE_LLM_ONNX = get_bool_env_var("USE_LLM_ONNX", True)
+
+# PyTorch specific configurations from Environment Variables (optional)
+PT_QUANTIZATION = os.getenv("PT_QUANTIZATION", "none") # none, fp16, int8
+PT_USE_COMPILE = get_bool_env_var("PT_USE_COMPILE", False) # Default to False for server stability unless explicitly enabled
+PT_COMPILE_MODE = os.getenv("PT_COMPILE_MODE", "reduce-overhead")
 
 # Create output directory if it doesn't exist
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -105,7 +124,31 @@ def initialize_model():
     if TTS_MODEL is None:
         device = get_device()
         logger.info(f"Initializing Spark-TTS model from {MODEL_DIR}")
-        TTS_MODEL = SparkTTS(MODEL_DIR, device)
+        logger.info("--- SparkTTS Configuration for API Server ---")
+        logger.info(f"  MODEL_DIR: {MODEL_DIR}")
+        logger.info(f"  Device: {device}")
+        logger.info(f"  --- ONNX Usage --- (Defaults to True if respective env var not set)")
+        logger.info(f"  USE_WAV2VEC2_ONNX: {USE_WAV2VEC2_ONNX} (from env var USE_WAV2VEC2_ONNX)")
+        logger.info(f"  USE_BICODEC_ONNX: {USE_BICODEC_ONNX} (from env var USE_BICODEC_ONNX)")
+        logger.info(f"  USE_SPEAKER_ENCODER_TOKENIZER_ONNX: {USE_SPEAKER_ENCODER_TOKENIZER_ONNX} (from env var USE_SPEAKER_ENCODER_TOKENIZER_ONNX)")
+        logger.info(f"  USE_LLM_ONNX: {USE_LLM_ONNX} (from env var USE_LLM_ONNX)")
+        logger.info("  --- PyTorch Specific Settings (if applicable) ---")
+        logger.info(f"  PT_QUANTIZATION: {PT_QUANTIZATION} (from env var PT_QUANTIZATION)")
+        logger.info(f"  PT_USE_COMPILE: {PT_USE_COMPILE} (from env var PT_USE_COMPILE)")
+        logger.info(f"  PT_COMPILE_MODE: {PT_COMPILE_MODE} (from env var PT_COMPILE_MODE)")
+        logger.info("---------------------------------------------")
+
+        TTS_MODEL = SparkTTS(
+            model_dir=Path(MODEL_DIR), 
+            device=device,
+            quantization=PT_QUANTIZATION if PT_QUANTIZATION != "none" else None,
+            use_compile=PT_USE_COMPILE,
+            compile_mode=PT_COMPILE_MODE,
+            use_wav2vec2_onnx=USE_WAV2VEC2_ONNX,
+            use_bicodec_onnx=USE_BICODEC_ONNX,
+            use_speaker_encoder_tokenizer_onnx=USE_SPEAKER_ENCODER_TOKENIZER_ONNX,
+            use_llm_onnx=USE_LLM_ONNX
+        )
     return TTS_MODEL
 
 @app.on_event("startup")
