@@ -203,7 +203,10 @@ class BiCodec(nn.Module):
 
                 print(f"BiCodec: Shape of mel_for_onnx before .cpu().numpy(): {mel_for_onnx.shape}")
                 # Ensure the tensor is contiguous before sending to ONNX
-                mels_np = mel_for_onnx.contiguous().cpu().numpy()
+                # The ONNX model's "mel_spectrogram" input was defined based on a (B, T_mel, F_mel) dummy input.
+                # mel_for_onnx is currently (B, F_mel, T_mel), so it needs to be permuted.
+                mels_np = mel_for_onnx.permute(0, 2, 1).contiguous().cpu().numpy()
+                print(f"BiCodec: Shape of mels_np for ONNX input (should be B, T, F): {mels_np.shape}") # Debug print for permuted shape
                 onnx_inputs = {'mel_spectrogram': mels_np}
                 
                 global_tokens_np = self.onnx_speaker_encoder_tokenizer_session.run(None, onnx_inputs)[0]
