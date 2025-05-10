@@ -191,6 +191,7 @@ class ECAPA_TDNN(nn.Module):
     def forward(self, x, return_latent=False):
         x = x.permute(0, 2, 1)  # (B,T,F) -> (B,F,T)
 
+        print(f"[ECAPA_TDNN] Input x shape: {x.shape}")
         out1 = self.layer1(x)
         out2 = self.layer2(out1)
         out3 = self.layer3(out2)

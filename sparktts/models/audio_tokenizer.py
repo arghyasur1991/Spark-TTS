@@ -41,16 +41,20 @@ class SimpleFeatMimic:
 class BiCodecTokenizer:
     """BiCodec tokenizer for handling audio input and tokenization."""
 
-    def __init__(self, model_dir: Path, device: torch.device = None, use_onnx_wav2vec2: bool = False, **kwargs):
+    def __init__(self, model_dir: Path, device: torch.device = None, use_onnx_wav2vec2: bool = False, use_speaker_encoder_tokenizer_onnx: bool = False, onnx_speaker_encoder_tokenizer_session=None, **kwargs):
         super().__init__()
         """
         Args:
             model_dir: Path to the model directory.
             device: Device to run the model on (default is GPU if available).
             use_onnx_wav2vec2 (bool): Whether to use ONNX for Wav2Vec2 feature extraction.
+            use_speaker_encoder_tokenizer_onnx (bool): Whether to use ONNX for Speaker Encoder tokenizer.
+            onnx_speaker_encoder_tokenizer_session: Pre-loaded ONNX session for Speaker Encoder.
         """
         self.original_device = device
         self.use_onnx_wav2vec2 = use_onnx_wav2vec2
+        self.use_speaker_encoder_tokenizer_onnx = use_speaker_encoder_tokenizer_onnx
+        self.onnx_speaker_encoder_tokenizer_session = onnx_speaker_encoder_tokenizer_session
         self.onnx_feature_extractor_session = None
         
         # For MPS devices, we'll use CPU for the model to avoid unsupported operations
@@ -66,9 +70,11 @@ class BiCodecTokenizer:
 
     def _initialize_model(self):
         """Load and initialize the BiCodec model and Wav2Vec2 feature extractor."""
-        self.model = BiCodec.load_from_checkpoint(f"{self.model_dir}/BiCodec").to(
-            self.device
-        )
+        self.model = BiCodec.load_from_checkpoint(
+            f"{self.model_dir}/BiCodec",
+            use_speaker_encoder_tokenizer_onnx=self.use_speaker_encoder_tokenizer_onnx,
+            onnx_speaker_encoder_tokenizer_session=self.onnx_speaker_encoder_tokenizer_session
+        ).to(self.device)
         self.processor = Wav2Vec2FeatureExtractor.from_pretrained(
             f"{self.model_dir}/wav2vec2-large-xlsr-53"
         )

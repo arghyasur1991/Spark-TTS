@@ -148,6 +148,11 @@ def parse_args():
         action="store_true",
         help="Use ONNX for BiCodec vocoder inference."
     )
+    parser.add_argument(
+        "--use_speaker_encoder_tokenizer_onnx",
+        action="store_true",
+        help="Use ONNX for Speaker Encoder tokenizer."
+    )
     return parser.parse_args()
 
 
@@ -182,7 +187,8 @@ def run_tts(args):
         use_compile=args.use_compile,
         compile_mode=args.compile_mode,
         use_wav2vec2_onnx=args.use_wav2vec2_onnx,
-        use_bicodec_onnx=args.use_bicodec_onnx
+        use_bicodec_onnx=args.use_bicodec_onnx,
+        use_speaker_encoder_tokenizer_onnx=args.use_speaker_encoder_tokenizer_onnx
     )
 
     # Run benchmark if requested

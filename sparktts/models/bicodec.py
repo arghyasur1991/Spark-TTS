@@ -43,6 +43,8 @@ class BiCodec(nn.Module):
         speaker_encoder: nn.Module,
         prenet: nn.Module,
         postnet: nn.Module,
+        use_speaker_encoder_tokenizer_onnx: bool = False,
+        onnx_speaker_encoder_tokenizer_session=None,
         **kwargs
     ) -> None:
         """
@@ -56,6 +58,8 @@ class BiCodec(nn.Module):
             speaker_encoder (nn.Module): Speaker encoder module.
             prenet (nn.Module): Prenet network.
             postnet (nn.Module): Postnet network.
+            use_speaker_encoder_tokenizer_onnx (bool): Whether to use ONNX for Speaker Encoder tokenizer.
+            onnx_speaker_encoder_tokenizer_session: Pre-loaded ONNX session for Speaker Encoder.
         """
         super().__init__()
         self.encoder = encoder
@@ -64,6 +68,8 @@ class BiCodec(nn.Module):
         self.speaker_encoder = speaker_encoder
         self.prenet = prenet
         self.postnet = postnet
+        self.use_speaker_encoder_tokenizer_onnx = use_speaker_encoder_tokenizer_onnx
+        self.onnx_speaker_encoder_tokenizer_session = onnx_speaker_encoder_tokenizer_session
         self.init_mel_transformer(mel_params)
 
     @classmethod
@@ -73,6 +79,7 @@ class BiCodec(nn.Module):
 
         Args:
             model_dir (Path): Path to the model directory containing checkpoint and config.
+            **kwargs: Additional arguments, potentially including ONNX session and flags.
         
         Returns:
             BiCodec: The initialized BiCodec model.
@@ -84,6 +91,10 @@ class BiCodec(nn.Module):
         # Get the device, if it's MPS we need special handling
         device = kwargs.get('device', None)
         using_mps = device is not None and device.type == 'mps'
+
+        # Extract ONNX related args from kwargs for speaker encoder
+        use_speaker_encoder_tokenizer_onnx = kwargs.get('use_speaker_encoder_tokenizer_onnx', False)
+        onnx_speaker_encoder_tokenizer_session = kwargs.get('onnx_speaker_encoder_tokenizer_session', None)
         
         # Initialize models (on CPU if using MPS to avoid unsupported ops)
         encoder = Encoder(**config["encoder"])
@@ -101,6 +112,8 @@ class BiCodec(nn.Module):
             speaker_encoder=speaker_encoder,
             prenet=prenet,
             postnet=postnet,
+            use_speaker_encoder_tokenizer_onnx=use_speaker_encoder_tokenizer_onnx,
+            onnx_speaker_encoder_tokenizer_session=onnx_speaker_encoder_tokenizer_session,
         )
 
         state_dict = load_file(ckpt_path)
@@ -166,11 +179,62 @@ class BiCodec(nn.Module):
             tuple: Semantic tokens and global tokens.
         """
         feat = batch["feat"]
-        mel = self.mel_transformer(batch["ref_wav"]).squeeze(1)
+        mel_for_speaker_encoder_full = self.mel_transformer(batch["ref_wav"].to(feat.device)).squeeze(1) # This might be (B, 301, T)
 
         z = self.encoder(feat.transpose(1, 2))
         semantic_tokens = self.quantizer.tokenize(z)
-        global_tokens = self.speaker_encoder.tokenize(mel.transpose(1, 2))
+        
+        # Conditional Speaker Encoding
+        if self.use_speaker_encoder_tokenizer_onnx and self.onnx_speaker_encoder_tokenizer_session:
+            print("BiCodec: Using ONNX Speaker Encoder Tokenizer.")
+            try:
+                # Ensure mel spec has 128 channels for the ONNX model
+                # Original ONNX model expects (B, 128, T)
+                if mel_for_speaker_encoder_full.shape[1] == 301:
+                    print(f"BiCodec: Original mel channels from mel_for_speaker_encoder_full: {mel_for_speaker_encoder_full.shape[1]}. Slicing to 128 for ONNX Speaker Encoder.")
+                    mel_for_onnx = mel_for_speaker_encoder_full[:, :128, :].contiguous()
+                elif mel_for_speaker_encoder_full.shape[1] == 128:
+                    print(f"BiCodec: Mel channels from mel_for_speaker_encoder_full are already 128: {mel_for_speaker_encoder_full.shape[1]}.")
+                    mel_for_onnx = mel_for_speaker_encoder_full # No slice needed, but ensure contiguous
+                else:
+                    # This case should ideally not be hit if the ONNX error consistently reports C:301 from a 301-channel input
+                    print(f"BiCodec: WARNING - Unexpected number of mel channels in mel_for_speaker_encoder_full: {mel_for_speaker_encoder_full.shape[1]}. Raising ValueError.")
+                    raise ValueError(f"Unexpected number of mel channels for ONNX: {mel_for_speaker_encoder_full.shape[1]}. Expected 128 or 301 to slice.")
+
+                print(f"BiCodec: Shape of mel_for_onnx before .cpu().numpy(): {mel_for_onnx.shape}")
+                # Ensure the tensor is contiguous before sending to ONNX
+                mels_np = mel_for_onnx.contiguous().cpu().numpy()
+                onnx_inputs = {'mel_spectrogram': mels_np}
+                
+                global_tokens_np = self.onnx_speaker_encoder_tokenizer_session.run(None, onnx_inputs)[0]
+                global_tokens = torch.from_numpy(global_tokens_np).to(feat.device)
+                print("BiCodec: ✓ Successfully used ONNX Speaker Encoder Tokenizer.")
+            except Exception as e:
+                print(f"BiCodec: ✗ Error using ONNX Speaker Encoder Tokenizer: {e}. Falling back to PyTorch.")
+                # Fallback: ensure the PyTorch path also gets 128 channels if that's what it expects
+                # This assumes self.speaker_encoder expects (B, T, 128) after transpose
+                if mel_for_speaker_encoder_full.shape[1] == 301:
+                    print("BiCodec: PyTorch fallback - Slicing 301 mels to 128 for PyTorch Speaker Encoder.")
+                    mel_for_pytorch_encoder = mel_for_speaker_encoder_full[:, :128, :].contiguous()
+                else: # Assuming it's already 128 or compatible
+                    mel_for_pytorch_encoder = mel_for_speaker_encoder_full
+                global_tokens = self.speaker_encoder.tokenize(mel_for_pytorch_encoder.transpose(1, 2))
+        else:
+            if self.use_speaker_encoder_tokenizer_onnx:
+                print("BiCodec: ONNX Speaker Encoder Tokenizer session not available. Falling back to PyTorch.")
+            else:
+                print("BiCodec: Using PyTorch Speaker Encoder Tokenizer.")
+            
+            # Ensure PyTorch path gets the correct number of channels (128)
+            # This assumes self.speaker_encoder expects (B, T, 128) after transpose
+            if mel_for_speaker_encoder_full.shape[1] == 301:
+                print("BiCodec: PyTorch path - Slicing 301 mels to 128 for PyTorch Speaker Encoder.")
+                mel_for_pytorch_encoder = mel_for_speaker_encoder_full[:, :128, :].contiguous()
+            elif mel_for_speaker_encoder_full.shape[1] == 128:
+                mel_for_pytorch_encoder = mel_for_speaker_encoder_full
+            else:
+                 raise ValueError(f"Unexpected number of mel channels for PyTorch SpeakerEncoder: {mel_for_speaker_encoder_full.shape[1]}. Expected 128 or 301 to slice.")
+            global_tokens = self.speaker_encoder.tokenize(mel_for_pytorch_encoder.transpose(1, 2))
 
         return semantic_tokens, global_tokens
 

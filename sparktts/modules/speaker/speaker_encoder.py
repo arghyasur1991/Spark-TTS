@@ -97,11 +97,11 @@ class SpeakerEncoder(nn.Module):
 
         return x_vector, d_vector
     
-    def tokenize(self, mels: torch.Tensor) -> torch.Tensor:
+    def tokenize(self, mels: torch.Tensor, onnx_export_mode: bool = False) -> torch.Tensor:
         """tokenize the input mel spectrogram"""
         _, features = self.speaker_encoder(mels, True)
         x = self.perceiver_sampler(features.transpose(1, 2)).transpose(1, 2)
-        zq, indices = self.quantizer(x)
+        zq, indices = self.quantizer(x, onnx_export_mode=onnx_export_mode)
         return indices
     
     def detokenize(self, indices: torch.Tensor, onnx_export_mode: bool = False) -> torch.Tensor:

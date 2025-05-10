@@ -41,6 +41,7 @@ class SparkTTS:
         compile_mode: str = "reduce-overhead",
         use_wav2vec2_onnx: bool = False,
         use_bicodec_onnx: bool = False,
+        use_speaker_encoder_tokenizer_onnx: bool = False,
     ):
         """
         Initializes the SparkTTS model with the provided configurations and device.
@@ -53,6 +54,7 @@ class SparkTTS:
             compile_mode (str, optional): Compilation mode for torch.compile (default, reduce-overhead, max-autotune).
             use_wav2vec2_onnx (bool, optional): Whether to use ONNX for Wav2Vec2 feature extraction in BiCodecTokenizer.
             use_bicodec_onnx (bool, optional): Whether to use ONNX for BiCodec vocoder inference.
+            use_speaker_encoder_tokenizer_onnx (bool, optional): Whether to use ONNX for Speaker Encoder tokenizer.
         """
         self.device = device
         self.model_dir = model_dir
@@ -63,7 +65,9 @@ class SparkTTS:
         self.compile_mode = compile_mode
         self.use_wav2vec2_onnx = use_wav2vec2_onnx
         self.use_bicodec_onnx = use_bicodec_onnx
+        self.use_speaker_encoder_tokenizer_onnx = use_speaker_encoder_tokenizer_onnx
         self.onnx_bicodec_vocoder_session = None
+        self.onnx_speaker_encoder_tokenizer_session = None
         self._initialize_inference()
 
     def _initialize_inference(self):
@@ -115,11 +119,13 @@ class SparkTTS:
                 print("Please upgrade PyTorch to use this feature")
         
         # Initialize audio tokenizer
-        print(f"Initializing BiCodecTokenizer with use_onnx_wav2vec2={self.use_wav2vec2_onnx}")
+        print(f"Initializing BiCodecTokenizer with use_onnx_wav2vec2={self.use_wav2vec2_onnx}, use_speaker_encoder_tokenizer_onnx={self.use_speaker_encoder_tokenizer_onnx}")
         self.audio_tokenizer = BiCodecTokenizer(
             self.model_dir, 
             device=self.device,
-            use_onnx_wav2vec2=self.use_wav2vec2_onnx
+            use_onnx_wav2vec2=self.use_wav2vec2_onnx,
+            use_speaker_encoder_tokenizer_onnx=self.use_speaker_encoder_tokenizer_onnx,
+            onnx_speaker_encoder_tokenizer_session=self.onnx_speaker_encoder_tokenizer_session
         )
         print("==== Model Initialization Complete ====\n")
 
@@ -145,6 +151,39 @@ class SparkTTS:
                 print(f"✗ ONNX BiCodec vocoder model not found at {onnx_vocoder_path}")
                 print("  Falling back to PyTorch BiCodec vocoder.")
                 self.onnx_bicodec_vocoder_session = None
+
+        # Conditionally load ONNX Speaker Encoder Tokenizer
+        if self.use_speaker_encoder_tokenizer_onnx:
+            onnx_se_tokenizer_path = Path("./onnx_models/speaker_encoder_tokenizer.onnx")
+            print(f"Attempting to load ONNX Speaker Encoder Tokenizer from: {onnx_se_tokenizer_path}")
+            if onnx_se_tokenizer_path.exists():
+                try:
+                    self.onnx_speaker_encoder_tokenizer_session = onnxruntime.InferenceSession(
+                        str(onnx_se_tokenizer_path),
+                        providers=['CPUExecutionProvider']
+                    )
+                    print(f"✓ Successfully loaded ONNX Speaker Encoder Tokenizer from {onnx_se_tokenizer_path}")
+                    # After loading, re-initialize BiCodecTokenizer if it needs the session at init time
+                    # Or, if BiCodecTokenizer can accept the session later, update it.
+                    # For now, assuming BiCodecTokenizer is initialized once and takes the session (which might be None initially)
+                    # Let's re-init here to ensure it gets the loaded session.
+                    print(f"Re-initializing BiCodecTokenizer to pass loaded ONNX Speaker Encoder Tokenizer session.")
+                    self.audio_tokenizer = BiCodecTokenizer(
+                        self.model_dir,
+                        device=self.device,
+                        use_onnx_wav2vec2=self.use_wav2vec2_onnx,
+                        use_speaker_encoder_tokenizer_onnx=self.use_speaker_encoder_tokenizer_onnx,
+                        onnx_speaker_encoder_tokenizer_session=self.onnx_speaker_encoder_tokenizer_session
+                    )
+                except Exception as e:
+                    print(f"✗ Failed to load ONNX Speaker Encoder Tokenizer: {e}")
+                    print("  Falling back to PyTorch Speaker Encoder Tokenizer.")
+                    self.onnx_speaker_encoder_tokenizer_session = None
+            else:
+                print(f"✗ ONNX Speaker Encoder Tokenizer model not found at {onnx_se_tokenizer_path}")
+                print("  Falling back to PyTorch Speaker Encoder Tokenizer.")
+                self.onnx_speaker_encoder_tokenizer_session = None
+            # If re-initialization was done above, this final print in _initialize_inference might be redundant or show updated status.
 
     def _measure_time(self, func, *args, **kwargs):
         """Helper method to measure execution time of a function."""
