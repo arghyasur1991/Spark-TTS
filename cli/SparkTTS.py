@@ -22,6 +22,14 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import onnxruntime
 import numpy as np
 
+# Try to import ORTModelForCausalLM and handle potential ImportError
+try:
+    from optimum.onnxruntime import ORTModelForCausalLM
+except ImportError:
+    ORTModelForCausalLM = None # Set to None if not available
+    print("Warning: optimum.onnxruntime.ORTModelForCausalLM not found. ONNX LLM inference will not be available.")
+    print("Please install Hugging Face Optimum: pip install optimum[onnxruntime] or optimum[onnxruntime-gpu]")
+
 from sparktts.utils.file import load_config
 from sparktts.models.audio_tokenizer import BiCodecTokenizer
 from sparktts.utils.token_parser import LEVELS_MAP, GENDER_MAP, TASK_TOKEN_MAP
@@ -42,6 +50,7 @@ class SparkTTS:
         use_wav2vec2_onnx: bool = False,
         use_bicodec_onnx: bool = False,
         use_speaker_encoder_tokenizer_onnx: bool = False,
+        use_llm_onnx: bool = False,
     ):
         """
         Initializes the SparkTTS model with the provided configurations and device.
@@ -55,6 +64,7 @@ class SparkTTS:
             use_wav2vec2_onnx (bool, optional): Whether to use ONNX for Wav2Vec2 feature extraction in BiCodecTokenizer.
             use_bicodec_onnx (bool, optional): Whether to use ONNX for BiCodec vocoder inference.
             use_speaker_encoder_tokenizer_onnx (bool, optional): Whether to use ONNX for Speaker Encoder tokenizer.
+            use_llm_onnx (bool, optional): Whether to use ONNX for LLM inference.
         """
         self.device = device
         self.model_dir = model_dir
@@ -66,59 +76,74 @@ class SparkTTS:
         self.use_wav2vec2_onnx = use_wav2vec2_onnx
         self.use_bicodec_onnx = use_bicodec_onnx
         self.use_speaker_encoder_tokenizer_onnx = use_speaker_encoder_tokenizer_onnx
+        self.use_llm_onnx = use_llm_onnx
         self.onnx_bicodec_vocoder_session = None
         self.onnx_speaker_encoder_tokenizer_session = None
+        self.onnx_llm_model = None
         self._initialize_inference()
 
     def _initialize_inference(self):
         """Initializes the tokenizer, model, and audio tokenizer for inference."""
         print("\n==== Initializing SparkTTS Model ====")
+        print(f"Loading tokenizer from: {self.model_dir}/LLM")
         self.tokenizer = AutoTokenizer.from_pretrained(f"{self.model_dir}/LLM")
         
-        # Load base model
-        if self.quantization == "fp16" and self.device.type in ["cuda", "mps"]:
-            # Load with FP16 precision for GPU
-            print("Using FP16 precision for model")
-            self.model = AutoModelForCausalLM.from_pretrained(
-                f"{self.model_dir}/LLM",
-                torch_dtype=torch.float16,
-            )
-        else:
-            # Load with default precision
-            self.model = AutoModelForCausalLM.from_pretrained(f"{self.model_dir}/LLM")
-        
-        # Apply quantization if requested
-        if self.quantization == "int8":
-            try:
-                # Use dynamic quantization for INT8
-                print("Applying INT8 dynamic quantization...")
-                self.model = torch.quantization.quantize_dynamic(
-                    self.model, {torch.nn.Linear}, dtype=torch.qint8
-                )
-                print("Applied INT8 dynamic quantization to model")
-            except Exception as e:
-                print(f"Failed to apply INT8 quantization: {e}")
-                print("Using original model without quantization")
-        
-        # Move model to device
-        self.model.to(self.device)
-        
-        # Apply torch.compile if requested (and available)
-        if self.use_compile:
-            if hasattr(torch, 'compile'):
-                try:
-                    print(f"Applying torch.compile with mode '{self.compile_mode}'...")
-                    # Available modes: default, reduce-overhead, max-autotune
-                    self.model = torch.compile(self.model, mode=self.compile_mode)
-                    print("✓ Model successfully compiled with torch.compile")
-                except Exception as e:
-                    print(f"✗ Failed to compile model: {e}")
-                    print("Using original model without compilation")
+        if self.use_llm_onnx:
+            if ORTModelForCausalLM is not None:
+                onnx_llm_path = Path("./onnx_models/LLM_onnx")
+                print(f"Attempting to load ONNX LLM from: {onnx_llm_path}")
+                if onnx_llm_path.exists() and (onnx_llm_path / "model.onnx").exists():
+                    try:
+                        self.onnx_llm_model = ORTModelForCausalLM.from_pretrained(onnx_llm_path)
+                        print(f"✓ Successfully loaded ONNX LLM from {onnx_llm_path}")
+                        self.model = None
+                    except Exception as e:
+                        print(f"✗ Failed to load ONNX LLM: {e}")
+                        print("  Falling back to PyTorch LLM.")
+                        self.onnx_llm_model = None
+                else:
+                    print(f"✗ ONNX LLM model not found at {onnx_llm_path} or model.onnx missing.")
+                    print("  Falling back to PyTorch LLM.")
+                    self.onnx_llm_model = None
             else:
-                print("✗ torch.compile not available - requires PyTorch 2.0+")
-                print("Please upgrade PyTorch to use this feature")
+                print("✗ Optimum ORTModelForCausalLM not available. Cannot use ONNX LLM. Falling back to PyTorch LLM.")
+                self.use_llm_onnx = False
+
+        if not self.onnx_llm_model:
+            print(f"Loading PyTorch LLM from: {self.model_dir}/LLM")
+            if self.quantization == "fp16" and self.device.type in ["cuda", "mps"]:
+                print("Using FP16 precision for PyTorch model")
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    f"{self.model_dir}/LLM",
+                    torch_dtype=torch.float16,
+                )
+            else:
+                self.model = AutoModelForCausalLM.from_pretrained(f"{self.model_dir}/LLM")
+            
+            if self.quantization == "int8":
+                try:
+                    print("Applying INT8 dynamic quantization to PyTorch model...")
+                    self.model = torch.quantization.quantize_dynamic(
+                        self.model, {torch.nn.Linear}, dtype=torch.qint8
+                    )
+                    print("Applied INT8 dynamic quantization to PyTorch model")
+                except Exception as e:
+                    print(f"Failed to apply INT8 quantization: {e}")
+            
+            self.model.to(self.device)
+            
+            if self.use_compile:
+                if hasattr(torch, 'compile'):
+                    try:
+                        print(f"Applying torch.compile with mode '{self.compile_mode}' to PyTorch model...")
+                        self.model = torch.compile(self.model, mode=self.compile_mode)
+                        print("✓ PyTorch Model successfully compiled with torch.compile")
+                    except Exception as e:
+                        print(f"✗ Failed to compile PyTorch model: {e}")
+                else:
+                    print("✗ torch.compile not available for PyTorch model - requires PyTorch 2.0+")
+            print("✓ PyTorch LLM initialized.")
         
-        # Initialize audio tokenizer
         print(f"Initializing BiCodecTokenizer with use_onnx_wav2vec2={self.use_wav2vec2_onnx}, use_speaker_encoder_tokenizer_onnx={self.use_speaker_encoder_tokenizer_onnx}")
         self.audio_tokenizer = BiCodecTokenizer(
             self.model_dir, 
@@ -129,30 +154,25 @@ class SparkTTS:
         )
         print("==== Model Initialization Complete ====\n")
 
-        # Conditionally load ONNX BiCodec Vocoder
         if self.use_bicodec_onnx:
-            # Define the path to the ONNX vocoder model
-            # TODO: Make this path configurable if necessary
             onnx_vocoder_path = Path("./onnx_models/bicodec_vocoder.onnx") 
             print(f"Attempting to load ONNX BiCodec vocoder from: {onnx_vocoder_path}")
             if onnx_vocoder_path.exists():
                 try:
-                    # Ensure model_dir path is a string for onnxruntime
                     self.onnx_bicodec_vocoder_session = onnxruntime.InferenceSession(
                         str(onnx_vocoder_path),
-                        providers=['CPUExecutionProvider'] # Or other preferred providers
+                        providers=['CPUExecutionProvider']
                     )
                     print(f"✓ Successfully loaded ONNX BiCodec vocoder from {onnx_vocoder_path}")
                 except Exception as e:
                     print(f"✗ Failed to load ONNX BiCodec vocoder: {e}")
                     print("  Falling back to PyTorch BiCodec vocoder.")
-                    self.onnx_bicodec_vocoder_session = None # Ensure it's None on failure
+                    self.onnx_bicodec_vocoder_session = None
             else:
                 print(f"✗ ONNX BiCodec vocoder model not found at {onnx_vocoder_path}")
                 print("  Falling back to PyTorch BiCodec vocoder.")
                 self.onnx_bicodec_vocoder_session = None
 
-        # Conditionally load ONNX Speaker Encoder Tokenizer
         if self.use_speaker_encoder_tokenizer_onnx:
             onnx_se_tokenizer_path = Path("./onnx_models/speaker_encoder_tokenizer.onnx")
             print(f"Attempting to load ONNX Speaker Encoder Tokenizer from: {onnx_se_tokenizer_path}")
@@ -163,10 +183,6 @@ class SparkTTS:
                         providers=['CPUExecutionProvider']
                     )
                     print(f"✓ Successfully loaded ONNX Speaker Encoder Tokenizer from {onnx_se_tokenizer_path}")
-                    # After loading, re-initialize BiCodecTokenizer if it needs the session at init time
-                    # Or, if BiCodecTokenizer can accept the session later, update it.
-                    # For now, assuming BiCodecTokenizer is initialized once and takes the session (which might be None initially)
-                    # Let's re-init here to ensure it gets the loaded session.
                     print(f"Re-initializing BiCodecTokenizer to pass loaded ONNX Speaker Encoder Tokenizer session.")
                     self.audio_tokenizer = BiCodecTokenizer(
                         self.model_dir,
@@ -183,7 +199,6 @@ class SparkTTS:
                 print(f"✗ ONNX Speaker Encoder Tokenizer model not found at {onnx_se_tokenizer_path}")
                 print("  Falling back to PyTorch Speaker Encoder Tokenizer.")
                 self.onnx_speaker_encoder_tokenizer_session = None
-            # If re-initialization was done above, this final print in _initialize_inference might be redundant or show updated status.
 
     def _measure_time(self, func, *args, **kwargs):
         """Helper method to measure execution time of a function."""
@@ -217,7 +232,6 @@ class SparkTTS:
             [f"<|bicodec_global_{i}|>" for i in global_token_ids.squeeze()]
         )
 
-        # Prepare the input tokens for the model
         if prompt_text is not None:
             semantic_tokens = "".join(
                 [f"<|bicodec_semantic_{i}|>" for i in semantic_token_ids.squeeze()]
@@ -353,15 +367,11 @@ class SparkTTS:
         Returns:
             torch.Tensor: Updated model inputs
         """
-        # Decode the tokenized inputs back to text
         prompt = self.tokenizer.decode(model_inputs.input_ids[0], skip_special_tokens=False)
-        # print(prompt)
         
-        # Replace the text between content markers
         if is_control_mode:
             new_prompt = self.process_prompt_control(gender, pitch, speed, new_text)
         else:
-            # Extract parts before and after content
             start_content_idx = prompt.find("<|start_content|>")
             end_content_idx = prompt.find("<|end_content|>")
             
@@ -370,7 +380,6 @@ class SparkTTS:
                 suffix = prompt[end_content_idx:]
                 new_prompt = prefix + new_text + suffix
         
-        # Re-tokenize with the new text
         return self.tokenizer([new_prompt], return_tensors="pt").to(self.device)
 
     @torch.no_grad()
@@ -416,7 +425,6 @@ class SparkTTS:
         timing_data = {} if collect_timing else None
         is_control_mode = gender is not None
         
-        # Use pre-built tokenized inputs or generate new ones
         if model_inputs is None:
             if text is None:
                 raise ValueError("Either text or model_inputs must be provided")
@@ -431,33 +439,44 @@ class SparkTTS:
             if collect_timing:
                 timing_data["tokenization_time"] = time.time() - tokenization_start
 
-        # Generate speech using the model
-        if collect_timing:
-            generation_start = time.time()
-            
-        generated_ids = self.model.generate(
-            **model_inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            top_k=top_k,
-            top_p=top_p,
-            temperature=temperature,
-        )
+        if self.use_llm_onnx and self.onnx_llm_model:
+            print("Using ONNX LLM for generation...")
+            generated_ids = self.onnx_llm_model.generate(
+                **model_inputs.to("cpu") if self.device.type != "cpu" else model_inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                top_k=top_k,
+                top_p=top_p,
+                temperature=temperature,
+                pad_token_id=self.tokenizer.eos_token_id
+            )
+        elif self.model:
+            if self.use_llm_onnx and not self.onnx_llm_model:
+                 print("Attempted to use ONNX LLM, but not loaded. Falling back to PyTorch LLM.")
+            print("Using PyTorch LLM for generation...")
+            generated_ids = self.model.generate(
+                **model_inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                top_k=top_k,
+                top_p=top_p,
+                temperature=temperature,
+                pad_token_id=self.tokenizer.eos_token_id
+            )
+        else:
+            raise RuntimeError("No LLM model (neither ONNX nor PyTorch) is available for inference.")
         
         if collect_timing:
             timing_data["model_generation_time"] = time.time() - generation_start
             token_extraction_start = time.time()
 
-        # Trim the output tokens to remove the input tokens
         generated_ids = [
             output_ids[len(input_ids) :]
             for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
         ]
 
-        # Decode the generated tokens into text
         predicts = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
-        # Extract semantic token IDs from the generated text
         pred_semantic_ids = (
             torch.tensor([int(token) for token in re.findall(r"bicodec_semantic_(\d+)", predicts)])
             .long()
@@ -476,25 +495,12 @@ class SparkTTS:
             timing_data["token_extraction_time"] = time.time() - token_extraction_start
             audio_conversion_start = time.time()
 
-        # Convert semantic tokens back to waveform
         if self.use_bicodec_onnx and self.onnx_bicodec_vocoder_session:
             print("Using ONNX BiCodec vocoder for audio generation...")
             try:
-                # Prepare inputs for ONNX session
-                # semantic_tokens from LLM output: [B, NumTokens]
-                # global_token_ids from prompt processing: [B, 1, NumGlobalTokensPerQuantizerLevel]
-                # Expected by ONNX model (based on export_bicodec_vocoder_onnx.py dummy inputs):
-                #   - semantic_tokens: [B, T_semantic_flat] or [B, N_quant_semantic, T_semantic]
-                #   - global_tokens:   [B, N_quant_global, T_global]
-                
-                # pred_semantic_ids is already [1, N_semantic_tokens]
-                # global_token_ids is [1, 1, N_global_tokens]
-                # These shapes should align with what the exported ONNX model expects.
-                
-                onnx_semantic_tokens_np = pred_semantic_ids.cpu().numpy().astype(np.int64) # Ensure correct dtype if not already
-                onnx_global_tokens_np = global_token_ids.cpu().numpy().astype(np.int32) # Ensure correct dtype
+                onnx_semantic_tokens_np = pred_semantic_ids.cpu().numpy().astype(np.int64)
+                onnx_global_tokens_np = global_token_ids.cpu().numpy().astype(np.int32)
 
-                # Get input names from the ONNX session
                 onnx_input_names = [inp.name for inp in self.onnx_bicodec_vocoder_session.get_inputs()]
                 
                 ort_inputs = {
@@ -502,23 +508,17 @@ class SparkTTS:
                     onnx_input_names[1]: onnx_global_tokens_np
                 }
                 
-                # Run ONNX inference
-                # Expected output: list containing one numpy array for the waveform
                 ort_outputs = self.onnx_bicodec_vocoder_session.run(None, ort_inputs)
-                wav = ort_outputs[0] # This is already a NumPy array
+                wav = ort_outputs[0]
                 print(f"ONNX BiCodec vocoder generated audio of shape: {wav.shape}")
 
-                # Squeeze the waveform to be compatible with soundfile.write
-                # soundfile expects [Samples] for mono or [Samples, Channels] for multi-channel
                 if wav.ndim == 3:
-                    if wav.shape[0] == 1 and wav.shape[1] == 1: # Shape [1, 1, Samples]
-                        wav = wav.squeeze() # Squeezes to [Samples]
-                    elif wav.shape[0] == 1: # Shape [1, Channels, Samples]
-                        wav = wav.squeeze(0).T # Squeezes to [Channels, Samples] then transpose to [Samples, Channels]
-                    # Add more specific cases if other 3D shapes are possible from ONNX output
-                elif wav.ndim == 2 and wav.shape[0] == 1: # Shape [1, Samples]
-                     wav = wav.squeeze(0) # Squeezes to [Samples]
-                # If wav is already 1D [Samples] or 2D [Samples, Channels], no change needed here.
+                    if wav.shape[0] == 1 and wav.shape[1] == 1:
+                        wav = wav.squeeze()
+                    elif wav.shape[0] == 1:
+                        wav = wav.squeeze(0).T
+                elif wav.ndim == 2 and wav.shape[0] == 1:
+                     wav = wav.squeeze(0)
 
             except Exception as e:
                 print(f"✗ Error during ONNX BiCodec vocoder inference: {e}")
@@ -538,7 +538,6 @@ class SparkTTS:
         if collect_timing:
             timing_data["audio_conversion_time"] = time.time() - audio_conversion_start
             
-            # Add total time and calculate percentages
             total_time = sum(timing_data.values())
             timing_data["total_time"] = total_time
             
@@ -546,7 +545,6 @@ class SparkTTS:
                 if key != "total_time":
                     timing_data[f"{key}_percent"] = (timing_data[key] / total_time) * 100
             
-            # Identify the heaviest operation
             heaviest_op = max([(k, v) for k, v in timing_data.items() 
                               if k not in ["total_time"] and not k.endswith("_percent")], 
                               key=lambda x: x[1])
@@ -589,7 +587,6 @@ class SparkTTS:
         """
         import time
         
-        # Benchmark results
         results = {
             "standard_flow": {"total_time": 0, "per_utterance": [], "timing_details": []},
             "optimized_flow": {"total_time": 0, "per_utterance": [], "timing_details": []},
@@ -598,7 +595,6 @@ class SparkTTS:
         }
         
         for run in range(num_runs):
-            # Standard flow (tokenize each time)
             standard_start = time.time()
             for text in text_list:
                 utterance_start = time.time()
@@ -620,10 +616,8 @@ class SparkTTS:
             standard_total = time.time() - standard_start
             results["standard_flow"]["total_time"] += standard_total / num_runs
             
-            # Optimized flow (reuse tokenized inputs)
             optimized_start = time.time()
             
-            # Initial tokenization
             tokenize_start = time.time()
             model_inputs, global_token_ids = self.tokenize_inputs(
                 text=text_list[0],
@@ -636,7 +630,6 @@ class SparkTTS:
             tokenization_time = time.time() - tokenize_start
             results["tokenization_time"] += tokenization_time / num_runs
             
-            # First utterance
             utterance_start = time.time()
             _, model_inputs, global_token_ids, timing_data = self.inference(
                 model_inputs=model_inputs,
@@ -650,11 +643,9 @@ class SparkTTS:
             results["optimized_flow"]["per_utterance"].append(utterance_time)
             results["optimized_flow"]["timing_details"].append(timing_data)
             
-            # Subsequent utterances
             for text in text_list[1:]:
                 utterance_start = time.time()
                 
-                # Update text in existing tokenized inputs if needed
                 is_control_mode = gender is not None
                 if is_control_mode:
                     updated_inputs = self.update_text_in_tokenized_inputs(
@@ -665,7 +656,8 @@ class SparkTTS:
                         model_inputs, text
                     )
                 
-                # Generate with updated inputs
+                utterance_start = time.time()
+                
                 _, updated_inputs, _, timing_data = self.inference(
                     model_inputs=updated_inputs,
                     global_token_ids=global_token_ids,
@@ -683,15 +675,12 @@ class SparkTTS:
             optimized_total = time.time() - optimized_start
             results["optimized_flow"]["total_time"] += optimized_total / num_runs
         
-        # Calculate average per-utterance times
         results["standard_flow"]["avg_per_utterance"] = sum(results["standard_flow"]["per_utterance"]) / len(results["standard_flow"]["per_utterance"])
         results["optimized_flow"]["avg_per_utterance"] = sum(results["optimized_flow"]["per_utterance"]) / len(results["optimized_flow"]["per_utterance"])
         
-        # Calculate speedup factor
         if results["standard_flow"]["total_time"] > 0:
             results["speedup_factor"] = results["standard_flow"]["total_time"] / results["optimized_flow"]["total_time"]
         
-        # Include some detailed metrics
         results["first_utterance_overhead"] = results["tokenization_time"]
         results["subsequent_utterance_speedup"] = (
             results["standard_flow"]["avg_per_utterance"] / 
@@ -699,35 +688,25 @@ class SparkTTS:
             if len(results["optimized_flow"]["per_utterance"]) > 1 else 0
         )
         
-        # Analyze operations to determine the heaviest
         results["operation_analysis"] = self._analyze_operations(results)
         
         return results
         
     def _analyze_operations(self, benchmark_results):
-        """Analyze the benchmark results to determine the heaviest operations."""
-        # Extract timing details from the benchmark
-        standard_timing = benchmark_results["standard_flow"]["timing_details"]
-        optimized_timing = benchmark_results["optimized_flow"]["timing_details"]
-        
-        # Initialize analysis results
         analysis = {
-            "standard_flow": self._aggregate_operation_timings(standard_timing),
-            "optimized_flow": self._aggregate_operation_timings(optimized_timing),
+            "standard_flow": self._aggregate_operation_timings(benchmark_results["standard_flow"]["timing_details"]),
+            "optimized_flow": self._aggregate_operation_timings(benchmark_results["optimized_flow"]["timing_details"]),
         }
         
         return analysis
         
     def _aggregate_operation_timings(self, timing_details):
-        """Aggregate operation timings across multiple runs."""
         if not timing_details:
             return {}
             
-        # Initialize aggregation
         aggregated = {}
         operation_count = {}
         
-        # Sum up all times for each operation
         for timing in timing_details:
             if not timing:
                 continue
@@ -743,12 +722,10 @@ class SparkTTS:
                 aggregated[op] += time_value
                 operation_count[op] += 1
         
-        # Calculate averages
         for op in aggregated:
             if operation_count[op] > 0:
                 aggregated[op] /= operation_count[op]
         
-        # Calculate total time and percentages
         if aggregated:
             total_time = sum(aggregated.values())
             aggregated["total_time"] = total_time
@@ -757,7 +734,6 @@ class SparkTTS:
                 if op != "total_time":
                     aggregated[f"{op}_percent"] = (aggregated[op] / total_time) * 100
             
-            # Find heaviest operation
             heaviest_op = max([(k, v) for k, v in aggregated.items() 
                               if k not in ["total_time"] and not k.endswith("_percent")], 
                               key=lambda x: x[1])

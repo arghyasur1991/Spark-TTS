@@ -53,6 +53,7 @@ compile_mode="reduce-overhead"  # default, reduce-overhead, max-autotune
 use_wav2vec2_onnx=true # Set to true to test ONNX, false for PyTorch
 use_bicodec_onnx_model=true  # Set to true to use ONNX for BiCodec Vocoder
 use_speaker_encoder_tokenizer_onnx=true  # Set to true to use ONNX for Speaker Encoder Tokenizer
+use_llm_onnx=true # New flag for ONNX LLM
 # ----------------------------- #
 
 # Change directory to the root directory
@@ -80,6 +81,7 @@ echo "  - Compile Mode: $compile_mode"
 echo "  - Use Wav2Vec2 ONNX: $use_wav2vec2_onnx"
 echo "  - Use BiCodec ONNX: $use_bicodec_onnx_model"
 echo "  - Use Speaker Encoder Tokenizer ONNX: $use_speaker_encoder_tokenizer_onnx"
+echo "  - Use LLM ONNX: $use_llm_onnx"
 echo
 
 # Set up additional arguments
@@ -99,13 +101,16 @@ fi
 # Add ONNX argument if enabled
 onnx_arg=""
 if [ "$use_wav2vec2_onnx" = true ]; then
-  onnx_arg="--use_wav2vec2_onnx"
+  onnx_arg="$onnx_arg --use_wav2vec2_onnx"
 fi
 if [[ "$use_bicodec_onnx_model" == "true" ]]; then # This is the new conditional block
   onnx_arg="$onnx_arg --use_bicodec_onnx"
 fi
 if [ "$use_speaker_encoder_tokenizer_onnx" = true ]; then
   onnx_arg="$onnx_arg --use_speaker_encoder_tokenizer_onnx"
+fi
+if [ "$use_llm_onnx" = true ]; then
+  onnx_arg="$onnx_arg --use_llm_onnx"
 fi
 
 echo -e "${GREEN}Starting inference...${NC}"
