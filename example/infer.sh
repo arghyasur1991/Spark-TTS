@@ -51,6 +51,7 @@ compile_mode="reduce-overhead"  # default, reduce-overhead, max-autotune
 
 # --- Test ONNX for Wav2Vec2 --- #
 use_wav2vec2_onnx=true # Set to true to test ONNX, false for PyTorch
+use_bicodec_onnx_model=true  # Set to true to use ONNX for BiCodec Vocoder
 # ----------------------------- #
 
 # Change directory to the root directory
@@ -76,6 +77,7 @@ echo "  - Reuse Tokenization: $reuse_tokenization"
 echo "  - Use Compile: $use_compile"
 echo "  - Compile Mode: $compile_mode"
 echo "  - Use Wav2Vec2 ONNX: $use_wav2vec2_onnx"
+echo "  - Use BiCodec ONNX: $use_bicodec_onnx_model"
 echo
 
 # Set up additional arguments
@@ -96,6 +98,9 @@ fi
 onnx_arg=""
 if [ "$use_wav2vec2_onnx" = true ]; then
   onnx_arg="--use_wav2vec2_onnx"
+fi
+if [[ "$use_bicodec_onnx_model" == "true" ]]; then # This is the new conditional block
+  onnx_arg="$onnx_arg --use_bicodec_onnx"
 fi
 
 echo -e "${GREEN}Starting inference...${NC}"

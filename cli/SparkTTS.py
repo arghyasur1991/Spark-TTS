@@ -19,6 +19,8 @@ import time
 from typing import Tuple, Dict, Optional, Literal
 from pathlib import Path
 from transformers import AutoTokenizer, AutoModelForCausalLM
+import onnxruntime
+import numpy as np
 
 from sparktts.utils.file import load_config
 from sparktts.models.audio_tokenizer import BiCodecTokenizer
@@ -38,6 +40,7 @@ class SparkTTS:
         use_compile: bool = False,
         compile_mode: str = "reduce-overhead",
         use_wav2vec2_onnx: bool = False,
+        use_bicodec_onnx: bool = False,
     ):
         """
         Initializes the SparkTTS model with the provided configurations and device.
@@ -49,6 +52,7 @@ class SparkTTS:
             use_compile (bool, optional): Whether to use torch.compile for acceleration (PyTorch 2.0+).
             compile_mode (str, optional): Compilation mode for torch.compile (default, reduce-overhead, max-autotune).
             use_wav2vec2_onnx (bool, optional): Whether to use ONNX for Wav2Vec2 feature extraction in BiCodecTokenizer.
+            use_bicodec_onnx (bool, optional): Whether to use ONNX for BiCodec vocoder inference.
         """
         self.device = device
         self.model_dir = model_dir
@@ -58,6 +62,8 @@ class SparkTTS:
         self.use_compile = use_compile
         self.compile_mode = compile_mode
         self.use_wav2vec2_onnx = use_wav2vec2_onnx
+        self.use_bicodec_onnx = use_bicodec_onnx
+        self.onnx_bicodec_vocoder_session = None
         self._initialize_inference()
 
     def _initialize_inference(self):
@@ -116,6 +122,29 @@ class SparkTTS:
             use_onnx_wav2vec2=self.use_wav2vec2_onnx
         )
         print("==== Model Initialization Complete ====\n")
+
+        # Conditionally load ONNX BiCodec Vocoder
+        if self.use_bicodec_onnx:
+            # Define the path to the ONNX vocoder model
+            # TODO: Make this path configurable if necessary
+            onnx_vocoder_path = Path("./onnx_models/bicodec_vocoder.onnx") 
+            print(f"Attempting to load ONNX BiCodec vocoder from: {onnx_vocoder_path}")
+            if onnx_vocoder_path.exists():
+                try:
+                    # Ensure model_dir path is a string for onnxruntime
+                    self.onnx_bicodec_vocoder_session = onnxruntime.InferenceSession(
+                        str(onnx_vocoder_path),
+                        providers=['CPUExecutionProvider'] # Or other preferred providers
+                    )
+                    print(f"✓ Successfully loaded ONNX BiCodec vocoder from {onnx_vocoder_path}")
+                except Exception as e:
+                    print(f"✗ Failed to load ONNX BiCodec vocoder: {e}")
+                    print("  Falling back to PyTorch BiCodec vocoder.")
+                    self.onnx_bicodec_vocoder_session = None # Ensure it's None on failure
+            else:
+                print(f"✗ ONNX BiCodec vocoder model not found at {onnx_vocoder_path}")
+                print("  Falling back to PyTorch BiCodec vocoder.")
+                self.onnx_bicodec_vocoder_session = None
 
     def _measure_time(self, func, *args, **kwargs):
         """Helper method to measure execution time of a function."""
@@ -409,10 +438,63 @@ class SparkTTS:
             audio_conversion_start = time.time()
 
         # Convert semantic tokens back to waveform
-        wav = self.audio_tokenizer.detokenize(
-            global_token_ids.to(self.device).squeeze(0),
-            pred_semantic_ids.to(self.device),
-        )
+        if self.use_bicodec_onnx and self.onnx_bicodec_vocoder_session:
+            print("Using ONNX BiCodec vocoder for audio generation...")
+            try:
+                # Prepare inputs for ONNX session
+                # semantic_tokens from LLM output: [B, NumTokens]
+                # global_token_ids from prompt processing: [B, 1, NumGlobalTokensPerQuantizerLevel]
+                # Expected by ONNX model (based on export_bicodec_vocoder_onnx.py dummy inputs):
+                #   - semantic_tokens: [B, T_semantic_flat] or [B, N_quant_semantic, T_semantic]
+                #   - global_tokens:   [B, N_quant_global, T_global]
+                
+                # pred_semantic_ids is already [1, N_semantic_tokens]
+                # global_token_ids is [1, 1, N_global_tokens]
+                # These shapes should align with what the exported ONNX model expects.
+                
+                onnx_semantic_tokens_np = pred_semantic_ids.cpu().numpy().astype(np.int64) # Ensure correct dtype if not already
+                onnx_global_tokens_np = global_token_ids.cpu().numpy().astype(np.int32) # Ensure correct dtype
+
+                # Get input names from the ONNX session
+                onnx_input_names = [inp.name for inp in self.onnx_bicodec_vocoder_session.get_inputs()]
+                
+                ort_inputs = {
+                    onnx_input_names[0]: onnx_semantic_tokens_np,
+                    onnx_input_names[1]: onnx_global_tokens_np
+                }
+                
+                # Run ONNX inference
+                # Expected output: list containing one numpy array for the waveform
+                ort_outputs = self.onnx_bicodec_vocoder_session.run(None, ort_inputs)
+                wav = ort_outputs[0] # This is already a NumPy array
+                print(f"ONNX BiCodec vocoder generated audio of shape: {wav.shape}")
+
+                # Squeeze the waveform to be compatible with soundfile.write
+                # soundfile expects [Samples] for mono or [Samples, Channels] for multi-channel
+                if wav.ndim == 3:
+                    if wav.shape[0] == 1 and wav.shape[1] == 1: # Shape [1, 1, Samples]
+                        wav = wav.squeeze() # Squeezes to [Samples]
+                    elif wav.shape[0] == 1: # Shape [1, Channels, Samples]
+                        wav = wav.squeeze(0).T # Squeezes to [Channels, Samples] then transpose to [Samples, Channels]
+                    # Add more specific cases if other 3D shapes are possible from ONNX output
+                elif wav.ndim == 2 and wav.shape[0] == 1: # Shape [1, Samples]
+                     wav = wav.squeeze(0) # Squeezes to [Samples]
+                # If wav is already 1D [Samples] or 2D [Samples, Channels], no change needed here.
+
+            except Exception as e:
+                print(f"✗ Error during ONNX BiCodec vocoder inference: {e}")
+                print("  Falling back to PyTorch BiCodec vocoder for this inference.")
+                wav = self.audio_tokenizer.detokenize(
+                    global_token_ids.to(self.device).squeeze(0),
+                    pred_semantic_ids.to(self.device),
+                )
+        else:
+            if self.use_bicodec_onnx and not self.onnx_bicodec_vocoder_session:
+                print("Attempted to use ONNX BiCodec vocoder, but session not loaded. Using PyTorch version.")
+            wav = self.audio_tokenizer.detokenize(
+                global_token_ids.to(self.device).squeeze(0),
+                pred_semantic_ids.to(self.device),
+            )
         
         if collect_timing:
             timing_data["audio_conversion_time"] = time.time() - audio_conversion_start
