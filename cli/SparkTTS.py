@@ -439,6 +439,9 @@ class SparkTTS:
             if collect_timing:
                 timing_data["tokenization_time"] = time.time() - tokenization_start
 
+        if collect_timing:
+            generation_start = time.time()
+            
         if self.use_llm_onnx and self.onnx_llm_model:
             print("Using ONNX LLM for generation...")
             generated_ids = self.onnx_llm_model.generate(
