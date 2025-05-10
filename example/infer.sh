@@ -49,6 +49,10 @@ reuse_tokenization=false
 use_compile=true
 compile_mode="reduce-overhead"  # default, reduce-overhead, max-autotune
 
+# --- Test ONNX for Wav2Vec2 --- #
+use_wav2vec2_onnx=true # Set to true to test ONNX, false for PyTorch
+# ----------------------------- #
+
 # Change directory to the root directory
 cd "$root_dir" || exit
 
@@ -71,6 +75,7 @@ echo "  - Sampling: $do_sample"
 echo "  - Reuse Tokenization: $reuse_tokenization"
 echo "  - Use Compile: $use_compile"
 echo "  - Compile Mode: $compile_mode"
+echo "  - Use Wav2Vec2 ONNX: $use_wav2vec2_onnx"
 echo
 
 # Set up additional arguments
@@ -85,6 +90,12 @@ fi
 
 if [ "$use_compile" = true ]; then
   additional_args="$additional_args --use_compile"
+fi
+
+# Add ONNX argument if enabled
+onnx_arg=""
+if [ "$use_wav2vec2_onnx" = true ]; then
+  onnx_arg="--use_wav2vec2_onnx"
 fi
 
 echo -e "${GREEN}Starting inference...${NC}"
@@ -102,7 +113,8 @@ python -m cli.inference \
     --top_k "${top_k}" \
     --top_p "${top_p}" \
     --compile_mode "${compile_mode}" \
-    ${additional_args}
+    ${additional_args} \
+    ${onnx_arg}
 
 echo -e "${GREEN}Inference complete! Results saved to ${save_dir}${NC}"
     

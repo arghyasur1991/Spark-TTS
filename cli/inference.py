@@ -138,6 +138,11 @@ def parse_args():
         default="reduce-overhead",
         help="Compilation mode for torch.compile"
     )
+    parser.add_argument(
+        "--use_wav2vec2_onnx",
+        action="store_true",
+        help="Use ONNX for Wav2Vec2 feature extraction in BiCodecTokenizer."
+    )
     return parser.parse_args()
 
 
@@ -170,7 +175,8 @@ def run_tts(args):
         device,
         quantization=args.quantization if args.quantization != "none" else None,
         use_compile=args.use_compile,
-        compile_mode=args.compile_mode
+        compile_mode=args.compile_mode,
+        use_wav2vec2_onnx=args.use_wav2vec2_onnx
     )
 
     # Run benchmark if requested

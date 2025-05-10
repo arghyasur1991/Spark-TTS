@@ -16,6 +16,7 @@
 
 import torch
 import numpy as np
+import os # Added for path checking
 
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -25,18 +26,32 @@ from sparktts.utils.file import load_config
 from sparktts.utils.audio import load_audio
 from sparktts.models.bicodec import BiCodec
 
+# Attempt to import onnxruntime, but don't fail if it's not there initially.
+# The user will need to install it.
+try:
+    import onnxruntime
+except ImportError:
+    onnxruntime = None
+
+# Helper class to mimic the structure of Hugging Face BaseModelOutput for .hidden_states
+class SimpleFeatMimic:
+    def __init__(self, hidden_states_list):
+        self.hidden_states = hidden_states_list
 
 class BiCodecTokenizer:
     """BiCodec tokenizer for handling audio input and tokenization."""
 
-    def __init__(self, model_dir: Path, device: torch.device = None, **kwargs):
+    def __init__(self, model_dir: Path, device: torch.device = None, use_onnx_wav2vec2: bool = False, **kwargs):
         super().__init__()
         """
         Args:
             model_dir: Path to the model directory.
             device: Device to run the model on (default is GPU if available).
+            use_onnx_wav2vec2 (bool): Whether to use ONNX for Wav2Vec2 feature extraction.
         """
         self.original_device = device
+        self.use_onnx_wav2vec2 = use_onnx_wav2vec2
+        self.onnx_feature_extractor_session = None
         
         # For MPS devices, we'll use CPU for the model to avoid unsupported operations
         if device is not None and device.type == "mps":
@@ -58,11 +73,34 @@ class BiCodecTokenizer:
             f"{self.model_dir}/wav2vec2-large-xlsr-53"
         )
         
-        # Load feature extractor on the same device as the model
-        self.feature_extractor = Wav2Vec2Model.from_pretrained(
-            f"{self.model_dir}/wav2vec2-large-xlsr-53"
-        ).to(self.device)
-        self.feature_extractor.config.output_hidden_states = True
+        wav2vec2_model_path_hf = f"{self.model_dir}/wav2vec2-large-xlsr-53"
+        onnx_model_path_str = f"{wav2vec2_model_path_hf}/model.onnx"
+
+        if self.use_onnx_wav2vec2:
+            if onnxruntime is None:
+                print("WARNING: use_onnx_wav2vec2 is True, but onnxruntime library is not found. Falling back to PyTorch.")
+                self.use_onnx_wav2vec2 = False # Disable if library not found
+            elif not os.path.exists(onnx_model_path_str):
+                print(f"WARNING: ONNX model for Wav2Vec2 not found at {onnx_model_path_str}. Falling back to PyTorch.")
+                self.use_onnx_wav2vec2 = False # Disable if model file not found
+            else:
+                try:
+                    # TODO: User might want to specify providers, e.g., ['CUDAExecutionProvider', 'CPUExecutionProvider']
+                    self.onnx_feature_extractor_session = onnxruntime.InferenceSession(onnx_model_path_str)
+                    print(f"Successfully loaded ONNX Wav2Vec2 feature extractor from {onnx_model_path_str}")
+                    # We don't need to load the PyTorch feature_extractor if ONNX is used
+                    self.feature_extractor = None 
+                except Exception as e:
+                    print(f"ERROR: Failed to load ONNX Wav2Vec2 model: {e}. Falling back to PyTorch.")
+                    self.use_onnx_wav2vec2 = False # Disable on error
+
+        if not self.use_onnx_wav2vec2 or self.feature_extractor is None: # Load PyTorch model if ONNX is not used or failed
+            print("Initializing PyTorch Wav2Vec2 feature extractor...")
+            self.feature_extractor = Wav2Vec2Model.from_pretrained(
+                wav2vec2_model_path_hf
+            ).to(self.device)
+            self.feature_extractor.config.output_hidden_states = True
+            print("PyTorch Wav2Vec2 feature extractor initialized.")
 
     def get_ref_clip(self, wav: np.ndarray) -> np.ndarray:
         """Get reference audio clip for speaker embedding."""
@@ -99,14 +137,40 @@ class BiCodecTokenizer:
             sampling_rate=16000,
             return_tensors="pt",
             padding=True,
-            output_hidden_states=True,
         ).input_values
         
-        # Process on the model's device (which is CPU if MPS was detected)
         inputs = inputs.to(self.device)
-        feat = self.feature_extractor(inputs)
+
+        if self.use_onnx_wav2vec2 and self.onnx_feature_extractor_session:
+            onnx_input_name = self.onnx_feature_extractor_session.get_inputs()[0].name
+            
+            # ONNX Runtime expects numpy arrays on CPU
+            onnx_inputs_np = inputs.cpu().numpy()
+            
+            # Run ONNX inference
+            # Assumes onnx_outputs is a list of numpy arrays, each being a hidden state tensor
+            # in the correct order (embeddings, layer1, layer2, ...).
+            onnx_outputs_np = self.onnx_feature_extractor_session.run(None, {onnx_input_name: onnx_inputs_np})
+            
+            # Convert numpy outputs back to tensors and move to the target device
+            # The user must ensure the ONNX model outputs hidden states in the expected order and quantity.
+            hidden_states_from_onnx = [torch.from_numpy(h).to(self.device) for h in onnx_outputs_np]
+            
+            # Wrap in a mimic object to provide .hidden_states attribute
+            feat = SimpleFeatMimic(hidden_states_list=hidden_states_from_onnx)
+        else:
+            # Original PyTorch path
+            if self.feature_extractor is None:
+                 raise RuntimeError("PyTorch feature_extractor is not initialized. This should not happen.")
+            feat = self.feature_extractor(inputs) # inputs is already on self.device
         
         # Calculate mixed features
+        # This part relies on 'feat' having a '.hidden_states' attribute that is a list/tuple of tensors.
+        # For PyTorch, feat.hidden_states[0] is embedding output, [1] is layer 1, etc.
+        # Wav2Vec2 paper uses 0-indexed layers. XLS-R (large) has 24 layers.
+        # Indices 11, 14, 16 would correspond to outputs of layers 10, 13, 15 if embeddings are at index 0.
+        # Or, if hidden_states directly maps to layer outputs (e.g. index 0 is layer 0), then it's layers 11, 14, 16.
+        # Let's assume the indices used (11, 14, 16) are correct for the list of hidden_states.
         feats_mix = (
             feat.hidden_states[11] + feat.hidden_states[14] + feat.hidden_states[16]
         ) / 3

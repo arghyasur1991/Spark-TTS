@@ -37,6 +37,7 @@ class SparkTTS:
         quantization: Optional[Literal["int8", "fp16", "none"]] = None,
         use_compile: bool = False,
         compile_mode: str = "reduce-overhead",
+        use_wav2vec2_onnx: bool = False,
     ):
         """
         Initializes the SparkTTS model with the provided configurations and device.
@@ -47,6 +48,7 @@ class SparkTTS:
             quantization (str, optional): Quantization method to use ('int8', 'fp16', or None).
             use_compile (bool, optional): Whether to use torch.compile for acceleration (PyTorch 2.0+).
             compile_mode (str, optional): Compilation mode for torch.compile (default, reduce-overhead, max-autotune).
+            use_wav2vec2_onnx (bool, optional): Whether to use ONNX for Wav2Vec2 feature extraction in BiCodecTokenizer.
         """
         self.device = device
         self.model_dir = model_dir
@@ -55,6 +57,7 @@ class SparkTTS:
         self.quantization = quantization
         self.use_compile = use_compile
         self.compile_mode = compile_mode
+        self.use_wav2vec2_onnx = use_wav2vec2_onnx
         self._initialize_inference()
 
     def _initialize_inference(self):
@@ -106,7 +109,12 @@ class SparkTTS:
                 print("Please upgrade PyTorch to use this feature")
         
         # Initialize audio tokenizer
-        self.audio_tokenizer = BiCodecTokenizer(self.model_dir, device=self.device)
+        print(f"Initializing BiCodecTokenizer with use_onnx_wav2vec2={self.use_wav2vec2_onnx}")
+        self.audio_tokenizer = BiCodecTokenizer(
+            self.model_dir, 
+            device=self.device,
+            use_onnx_wav2vec2=self.use_wav2vec2_onnx
+        )
         print("==== Model Initialization Complete ====\n")
 
     def _measure_time(self, func, *args, **kwargs):
