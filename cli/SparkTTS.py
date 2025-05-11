@@ -422,70 +422,227 @@ class SparkTTS:
         global_token_ids: torch.Tensor = None,
         collect_timing: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
-        """
-        Performs inference to generate speech from text, incorporating prompt audio and/or text.
+        if collect_timing:
+            timing_data = {}
+            overall_start_time = time.time()
+            tokenization_start = time.time()
 
-        Args:
-            text (str, optional): The text input to be converted to speech.
-            prompt_speech_path (Path, optional): Path to the audio file used as a prompt.
-            prompt_text (str, optional): Transcript of the prompt audio.
-            gender (str, optional): female | male.
-            pitch (str, optional): very_low | low | moderate | high | very_high
-            speed (str, optional): very_low | low | moderate | high | very_high
-            temperature (float, optional): Sampling temperature for controlling randomness. Default is 0.8.
-            top_k (float, optional): Top-k sampling parameter. Default is 50.
-            top_p (float, optional): Top-p (nucleus) sampling parameter. Default is 0.95.
-            max_new_tokens (int, optional): Maximum number of new tokens to generate. Default is 3000.
-            do_sample (bool, optional): Whether to use sampling for generation. Default is True.
-            model_inputs (torch.Tensor, optional): Pre-tokenized inputs to use instead of text.
-            global_token_ids (torch.Tensor, optional): Pre-generated global token IDs.
-            collect_timing (bool, optional): Whether to collect and return timing data.
-
-        Returns:
-            Tuple: Containing (waveform, model_inputs, global_token_ids, timing_data)
-        """
-        timing_data = {} if collect_timing else None
-        is_control_mode = gender is not None
-        
-        if model_inputs is None:
-            if text is None:
-                raise ValueError("Either text or model_inputs must be provided")
-                
-            if collect_timing:
-                tokenization_start = time.time()
-                
-            model_inputs_tuple = self.tokenize_inputs(
+        if model_inputs is None or global_token_ids is None:
+            # Tokenize inputs if not provided
+            model_inputs, global_token_ids = self.tokenize_inputs(
                 text, prompt_speech_path, prompt_text, gender, pitch, speed
             )
-            model_inputs = model_inputs_tuple[0] # Actual model_inputs tensor
-            if global_token_ids is None: # If not passed in, get it from tokenize_inputs
-                 global_token_ids = model_inputs_tuple[1]
-            
-            if collect_timing:
-                timing_data["tokenization_time"] = time.time() - tokenization_start
         
-        # Save LLM Input IDs
+        if collect_timing:
+            timing_data["tokenization_time"] = time.time() - tokenization_start
+            # print(f"Tokenization time: {timing_data['tokenization_time']:.4f}s")
+
+
+        # Save LLM Input IDs (Unchanged)
         llm_input_ids_path = "python_llm_input_ids.npy"
         try:
-            # model_inputs.input_ids are usually torch.long (int64)
-            # Assuming batch size 1 for saving, so take [0]
             np.save(llm_input_ids_path, model_inputs.input_ids[0].cpu().numpy())
             print(f"Saved LLM input_ids to {llm_input_ids_path} (Shape: {model_inputs.input_ids[0].shape})")
         except Exception as e:
             print(f"Error saving {llm_input_ids_path}: {e}")
 
+        # --- START DEBUG: Manual 2-step generation for logit comparison ---
+        if self.use_llm_onnx and self.onnx_llm_model:
+            print("\n--- DEBUG PYTHON LLM MANUAL 2-STEP ---")
+            
+            # Determine target device for manual forward pass inputs
+            manual_pass_device = torch.device("cpu") if self.device.type != "cpu" else self.device
+            print(f"Manual pass inputs will be on device: {manual_pass_device}")
+
+            initial_input_ids = model_inputs.input_ids.to(manual_pass_device)
+            initial_attention_mask = model_inputs.attention_mask.to(manual_pass_device)
+            
+            # Create initial position_ids if not present in model_inputs (common for HF tokenizers)
+            if "position_ids" not in model_inputs:
+                initial_seq_length = initial_input_ids.shape[1]
+                initial_position_ids = torch.arange(0, initial_seq_length, dtype=torch.long, device=manual_pass_device).unsqueeze(0)
+            else:
+                initial_position_ids = model_inputs.position_ids.to(manual_pass_device)
+
+            # Ensure input_ids is torch.long
+            initial_input_ids = initial_input_ids.long()
+
+            print(f"Initial input_ids shape: {initial_input_ids.shape}, dtype: {initial_input_ids.dtype}")
+            print(f"Initial attention_mask shape: {initial_attention_mask.shape}, dtype: {initial_attention_mask.dtype}")
+            print(f"Initial position_ids shape: {initial_position_ids.shape}, dtype: {initial_position_ids.dtype}")
+
+            # Step 0: Process prompt to get KV cache and logits for the 1st new token
+            print("Running Step 0 (Prompt Processing)...")
+            outputs_step0 = self.onnx_llm_model(
+                input_ids=initial_input_ids,
+                attention_mask=initial_attention_mask,
+                position_ids=initial_position_ids,
+                use_cache=True # Essential for getting past_key_values
+            )
+            logits_step0 = outputs_step0.logits
+            past_kv_step0 = outputs_step0.past_key_values # This is the KV cache after the prompt
+            
+            # Get the first generated token (greedy)
+            # Logits shape: (batch_size, sequence_length, vocab_size)
+            # We need logits for the *last* token of the input sequence to predict the *next* token
+            first_new_token_id = torch.argmax(logits_step0[:, -1, :], dim=-1).unsqueeze(0) # Shape: (1, 1)
+            print(f"Manually generated 1st new token ID: {first_new_token_id.item()}")
+
+
+            # Step 1: Generate the 2nd new token using the 1st new token and past_kv_step0
+            print("Running Step 1 (Generating 2nd token)...")
+            input_ids_step1 = first_new_token_id.to(manual_pass_device) # Ensure this is also on the correct device
+            
+            # Update attention_mask: append 1 for the new token
+            attention_mask_step1 = torch.cat((initial_attention_mask, torch.ones_like(input_ids_step1.to(initial_attention_mask.device))), dim=1) # Ensure ones_like is on same device as initial_attention_mask for cat
+            attention_mask_step1 = attention_mask_step1.to(manual_pass_device)
+            
+            # Update position_ids: the position of the new token is the sequence length of the initial prompt
+            position_ids_step1 = torch.tensor([[initial_input_ids.shape[1]]], dtype=torch.long, device=manual_pass_device)
+
+            print(f"Step 1 input_ids shape: {input_ids_step1.shape}, value: {input_ids_step1.item()}, dtype: {input_ids_step1.dtype}")
+            print(f"Step 1 attention_mask shape: {attention_mask_step1.shape}, dtype: {attention_mask_step1.dtype}")
+            print(f"Step 1 position_ids shape: {position_ids_step1.shape}, dtype: {position_ids_step1.dtype}")
+
+
+            outputs_step1 = self.onnx_llm_model(
+                input_ids=input_ids_step1,
+                attention_mask=attention_mask_step1, 
+                position_ids=position_ids_step1,
+                past_key_values=past_kv_step0, # Feed the KV cache from step 0
+                use_cache=True # To get updated KV if we were to continue
+            )
+            logits_step1_for_2nd_token = outputs_step1.logits # Shape (1, 1, vocab_size)
+            
+            # Get the second generated token (greedy)
+            second_new_token_id = torch.argmax(logits_step1_for_2nd_token[:, -1, :], dim=-1).unsqueeze(0)
+            print(f"Manually generated 2nd new token ID: {second_new_token_id.item()}")
+
+            # Save the logits that determined the 2nd token
+            logits_for_2nd_gen_token_path = "python_logits_for_2nd_gen_token.npy"
+            try:
+                # Logits are (batch_size, seq_len=1, vocab_size). Save the (vocab_size,) array.
+                np.save(logits_for_2nd_gen_token_path, logits_step1_for_2nd_token[0,0,:].cpu().numpy())
+                print(f"Saved Python logits for 2nd generated token to {logits_for_2nd_gen_token_path} (Shape: {logits_step1_for_2nd_token[0,0,:].shape})")
+            except Exception as e:
+                print(f"Error saving {logits_for_2nd_gen_token_path}: {e}")
+            print("--- END DEBUG PYTHON LLM MANUAL 2-STEP ---\n")
+        # --- END DEBUG ---
+
+        # --- START PYTHON C#-STYLE LOOP SIMULATION ---
+        if self.use_llm_onnx and self.onnx_llm_model:
+            print("\n--- PYTHON C#-STYLE LOOP SIMULATION ---")
+            sim_manual_pass_device = torch.device("cpu") if self.device.type != "cpu" else self.device
+            print(f"Simulated loop inputs will be on device: {sim_manual_pass_device}")
+
+            sim_initial_input_ids = model_inputs.input_ids.to(sim_manual_pass_device).long()
+            sim_initial_attention_mask = model_inputs.attention_mask.to(sim_manual_pass_device).long()
+            sim_initial_seq_length = sim_initial_input_ids.shape[1]
+
+            if "position_ids" not in model_inputs:
+                sim_initial_position_ids = torch.arange(0, sim_initial_seq_length, dtype=torch.long, device=sim_manual_pass_device).unsqueeze(0)
+            else:
+                sim_initial_position_ids = model_inputs.position_ids.to(sim_manual_pass_device).long()
+
+            print(f"SimLoop: Initial input_ids shape: {sim_initial_input_ids.shape}, dtype: {sim_initial_input_ids.dtype}")
+            print(f"SimLoop: Initial attention_mask shape: {sim_initial_attention_mask.shape}, dtype: {sim_initial_attention_mask.dtype}")
+            print(f"SimLoop: Initial position_ids shape: {sim_initial_position_ids.shape}, dtype: {sim_initial_position_ids.dtype}")
+
+            # Initial pass (prompt processing)
+            print("SimLoop: Running Initial Pass (Prompt Processing)...")
+            sim_outputs_step0 = self.onnx_llm_model(
+                input_ids=sim_initial_input_ids,
+                attention_mask=sim_initial_attention_mask,
+                position_ids=sim_initial_position_ids,
+                use_cache=True
+            )
+            sim_logits_current_step = sim_outputs_step0.logits
+            sim_past_kv_current_step = sim_outputs_step0.past_key_values
+            
+            sim_generated_token_ids = []
+            current_input_ids_for_loop = sim_initial_input_ids # Keeps track of all input IDs for length calc
+
+            for i in range(max_new_tokens): # Same max_new_tokens as C# and Python's generate()
+                # Select next token (greedy)
+                # Logits are for the *last* token of the current input sequence
+                sim_next_token_id_tensor = torch.argmax(sim_logits_current_step[:, -1, :], dim=-1).unsqueeze(0) # Shape (1,1)
+                sim_next_token_id = sim_next_token_id_tensor.item()
+                sim_generated_token_ids.append(sim_next_token_id)
+                print(f"SimLoop [Step {i}]: Generated token ID: {sim_next_token_id}")
+
+                if sim_next_token_id == self.tokenizer.eos_token_id:
+                    print(f"SimLoop [Step {i}]: EOS token ({self.tokenizer.eos_token_id}) generated. Stopping.")
+                    break
+
+                # Prepare inputs for the next step
+                sim_input_ids_next_step = sim_next_token_id_tensor.to(sim_manual_pass_device) # Already (1,1) and on correct device
+                
+                # Update attention mask: append 1 for the new token
+                # current_input_ids_for_loop includes the prompt + all previously generated tokens
+                # attention_mask should cover all of these plus the new one we are feeding now
+                # The ONNX model expects attention_mask for the current token + all past tokens in KV cache
+                # So, if KV cache has length L, and new token has length 1, attention mask is L+1
+                # sim_past_kv_current_step[0][0].shape is (batch, num_heads, seq_len, head_dim)
+                # The seq_len in KV cache is the length of everything processed so far.
+                # So, attention mask should be seq_len_in_kv + 1 (for current token)
+                
+                # The length of the current full sequence (prompt + already generated tokens)
+                # This is also the length of the KV cache sequence dimension
+                current_total_sequence_length = sim_past_kv_current_step[0][0].shape[2] 
+                
+                # The attention mask for the next step needs to cover all elements in the KV cache + the new token
+                # It should be all 1s. Its length is current_total_sequence_length + 1.
+                sim_attention_mask_next_step = torch.ones((1, current_total_sequence_length + 1), dtype=torch.long, device=sim_manual_pass_device)
+                
+                # Position ID for the new token is its index in the full sequence
+                sim_position_ids_next_step = torch.tensor([[current_total_sequence_length]], dtype=torch.long, device=sim_manual_pass_device)
+
+                if i < 2: # Log shapes for first few steps
+                    print(f"SimLoop [Step {i} Inputs for Next]: next_input_ids shape {sim_input_ids_next_step.shape}, value {sim_input_ids_next_step.item()}")
+                    print(f"SimLoop [Step {i} Inputs for Next]: next_attention_mask shape {sim_attention_mask_next_step.shape}")
+                    print(f"SimLoop [Step {i} Inputs for Next]: next_position_ids shape {sim_position_ids_next_step.shape}, value {sim_position_ids_next_step.item()}")
+                    # For KV cache, print shape of one of the tensors
+                    if sim_past_kv_current_step and sim_past_kv_current_step[0] and len(sim_past_kv_current_step[0]) > 0:
+                         print(f"SimLoop [Step {i} Inputs for Next]: past_kv_key[0] shape {sim_past_kv_current_step[0][0].shape}") # Example layer 0 key
+            
+                # Run inference for the next token
+                sim_outputs_next_step = self.onnx_llm_model(
+                    input_ids=sim_input_ids_next_step,
+                    attention_mask=sim_attention_mask_next_step,
+                    position_ids=sim_position_ids_next_step,
+                    past_key_values=sim_past_kv_current_step,
+                    use_cache=True
+                )
+                sim_logits_current_step = sim_outputs_next_step.logits
+                sim_past_kv_current_step = sim_outputs_next_step.past_key_values
+                current_input_ids_for_loop = torch.cat((current_input_ids_for_loop, sim_next_token_id_tensor), dim=1)
+            
+            print(f"SimLoop: Finished generation. Total tokens generated: {len(sim_generated_token_ids)}")
+            print(f"SimLoop: Generated token IDs: {sim_generated_token_ids}")
+
+            sim_loop_tokens_path = "python_simulated_csharp_loop_tokens.npy"
+            try:
+                np.save(sim_loop_tokens_path, np.array(sim_generated_token_ids, dtype=np.int64))
+                print(f"Saved Python C#-style loop simulated tokens to {sim_loop_tokens_path} (Shape: {(len(sim_generated_token_ids),)}, Dtype: int64)")
+            except Exception as e:
+                print(f"Error saving {sim_loop_tokens_path}: {e}")
+            print("--- END PYTHON C#-STYLE LOOP SIMULATION ---\n")
+        # --- END C#-STYLE SIMULATION ---
+
+
         if collect_timing:
             generation_start = time.time()
             
+        # Original generation call (still useful for full sequence NPY dump)
         if self.use_llm_onnx and self.onnx_llm_model:
-            print("Using ONNX LLM for generation...")
+            print("Using ONNX LLM for generation (full sequence)...") # Clarified this is the full sequence run
             generated_ids = self.onnx_llm_model.generate(
-                **model_inputs.to("cpu") if self.device.type != "cpu" else model_inputs,
+                **model_inputs.to("cpu") if self.device.type != "cpu" else model_inputs, # ensure model_inputs is on CPU if model is
                 max_new_tokens=max_new_tokens,
-                do_sample=do_sample,
-                top_k=top_k,
-                top_p=top_p,
-                temperature=temperature,
+                do_sample=False, # Greedy, as per previous setup
+                # top_k=top_k,
+                # top_p=top_p,
+                # temperature=temperature,
                 pad_token_id=self.tokenizer.eos_token_id
             )
         elif self.model:
