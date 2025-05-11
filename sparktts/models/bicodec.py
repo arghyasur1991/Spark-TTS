@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Dict, Any
 from omegaconf import DictConfig
 from safetensors.torch import load_file
+import numpy as np
 
 from sparktts.utils.file import load_config
 from sparktts.modules.speaker.speaker_encoder import SpeakerEncoder
@@ -147,6 +148,17 @@ class BiCodec(nn.Module):
             print("BiCodec: Using ONNX MelSpectrogram.")
             try:
                 wav_np = wav_tensor.cpu().numpy() # Ensure it's on CPU for ONNX
+
+                # --- BEGIN MODIFICATION: Save wav_np ---
+                try:
+                    # Save to the current working directory, typically Spark-TTS/ when infer.sh is run
+                    save_path = "python_audio_for_mel_onnx.npy"
+                    np.save(save_path, wav_np)
+                    print(f"BiCodec: Saved input wav_tensor (as wav_np) to {save_path} (Shape: {wav_np.shape}, Dtype: {wav_np.dtype})")
+                except Exception as e_save:
+                    print(f"BiCodec: ✗ Error saving wav_np to {save_path}: {e_save}")
+                # --- END MODIFICATION ---
+                
                 onnx_input_name = self.onnx_mel_spectrogram_session.get_inputs()[0].name
                 onnx_inputs = {onnx_input_name: wav_np}
                 mel_np = self.onnx_mel_spectrogram_session.run(None, onnx_inputs)[0]
