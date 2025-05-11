@@ -173,6 +173,8 @@ def main():
         print(f"Resampling audio from {sample_rate} Hz to {target_sample_rate} Hz...")
         resampler = TT.Resample(orig_freq=sample_rate, new_freq=target_sample_rate).to(pytorch_device)
         waveform = resampler(waveform)
+    else:
+        print(f"Audio sample rate ({sample_rate} Hz) matches target rate ({target_sample_rate} Hz). Skipping resampling.")
     
     if waveform.ndim == 1: 
         waveform = waveform.unsqueeze(0).unsqueeze(0)
@@ -187,6 +189,26 @@ def main():
          return
     print(f"Loaded audio waveform shape for Mel ONNX (B, C, T): {waveform.shape}")
     waveform_np = waveform.cpu().numpy() # ONNX runtime expects numpy
+
+    # ---- START: Dump raw audio samples for comparison ----
+    print(f"Python Raw Audio (waveform_np) Shape: {waveform_np.shape}")
+    print(f"Python Raw Audio (waveform_np) Length: {waveform_np.size}")
+    print("Python Raw Audio (waveform_np) Data (first 50 flat, F8 format):")
+    flat_waveform_np = waveform_np.flatten()
+    for i, val in enumerate(flat_waveform_np[:50]):
+        print(f"{val:.8f}", end=", ")
+        if (i + 1) % 10 == 0: print("") 
+    print("\\n")
+
+    if waveform_np.size > 1000:
+        print("Python Raw Audio (waveform_np) Data (middle 10 flat around index 500, F8 format):")
+        for i, val in enumerate(flat_waveform_np[500:510]):
+            print(f"{val:.8f}", end=", ")
+        print("\\n")
+    
+    np.save("python_audio_for_mel_onnx.npy", waveform_np)
+    print("Saved python_audio_for_mel_onnx.npy")
+    # ---- END: Dump raw audio samples for comparison ----
 
     # 3. Calculate Mel Spectrogram using the provided Mel ONNX model
     mel_spectrogram_onnx_output = None
