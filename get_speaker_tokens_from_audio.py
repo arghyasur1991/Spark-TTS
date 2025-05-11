@@ -113,8 +113,56 @@ class MelSpectrogramCalculator(torch.nn.Module):
         mel_output = mel_output.transpose(1, 2) 
         return mel_output
 
+def get_llm_model_dims(ort_session):
+    num_layers = 0
+    num_heads = 0
+    head_dim = 0
+
+    for i_input in ort_session.get_inputs():
+        if "past_key_values" in i_input.name and ".key" in i_input.name: # e.g. past_key_values.0.key
+            try:
+                layer_index = int(i_input.name.split('.')[1])
+                if layer_index + 1 > num_layers:
+                    num_layers = layer_index + 1
+                
+                # Shape: (batch_size, num_heads, past_seq_len, head_dim)
+                shape = i_input.shape
+                if len(shape) == 4:
+                    if num_heads == 0: # Infer from first one found
+                        num_heads = shape[1] if isinstance(shape[1], int) else 0
+                    if head_dim == 0: # Infer from first one found
+                        head_dim = shape[3] if isinstance(shape[3], int) else 0
+            except Exception as e:
+                print(f"Warning: Could not parse layer_index or dims from input {i_input.name}: {e}")
+
+    if num_layers == 0: # Fallback if not found in inputs (e.g. model that only has present_outputs)
+         for o_output in ort_session.get_outputs():
+            if "present" in o_output.name and ".key" in o_output.name: # e.g. present.0.key
+                try:
+                    layer_index = int(o_output.name.split('.')[1])
+                    if layer_index + 1 > num_layers:
+                        num_layers = layer_index + 1
+                    shape = o_output.shape
+                    if len(shape) == 4: # (batch_size, num_heads, seq_len, head_dim)
+                         if num_heads == 0: num_heads = shape[1] if isinstance(shape[1], int) else 0
+                         if head_dim == 0: head_dim = shape[3] if isinstance(shape[3], int) else 0
+                except:
+                    pass # ignore parsing errors
+
+    if num_layers == 0 or num_heads == 0 or head_dim == 0:
+        print(f"Warning: Could not reliably infer all LLM dimensions. Found: Layers={num_layers}, Heads={num_heads}, HeadDim={head_dim}. Using defaults if zero.")
+        # Provide some defaults if any are zero, though this is a sign of issue.
+        if num_layers == 0: num_layers = 32 # Common default
+        if num_heads == 0: num_heads = 32 # Common default
+        if head_dim == 0: head_dim = 128 # Common default
+        print(f"Updated to: Layers={num_layers}, Heads={num_heads}, HeadDim={head_dim} (defaults applied where necessary).")
+
+
+    print(f"Inferred LLM Dims: Layers={num_layers}, Heads={num_heads}, HeadDim={head_dim}")
+    return num_layers, num_heads, head_dim
+
 def main():
-    parser = argparse.ArgumentParser(description="Extract Speaker Tokens from an audio file using ONNX for both Mel and Speaker Encoding, and optionally generate LLM input_ids.")
+    parser = argparse.ArgumentParser(description="Extract Speaker Tokens from an audio file using ONNX for both Mel and Speaker Encoding, and optionally generate LLM input_ids and semantic tokens.")
     parser.add_argument(
         "--model_base_dir", 
         type=str, 
@@ -155,6 +203,28 @@ def main():
         default=None,
         help="Comma-separated string of integer speaker token IDs. If provided and --process_for_llm_input_ids is set, these tokens will be used instead of deriving them from audio."
     )
+    parser.add_argument(
+        "--llm_onnx_path",
+        type=str,
+        help="Path to the LLM ONNX model. Required if --generate_semantic_tokens is set."
+    )
+    parser.add_argument(
+        "--generate_semantic_tokens",
+        action="store_true",
+        help="If set, the script will run the LLM ONNX model to generate semantic tokens."
+    )
+    parser.add_argument(
+        "--max_new_semantic_tokens",
+        type=int,
+        default=768, # Typical value for semantic tokens
+        help="Maximum number of new semantic tokens to generate. Only used if --generate_semantic_tokens is set."
+    )
+    parser.add_argument(
+        "--llm_eos_token_id",
+        type=int,
+        default=151645, # Default for <|im_end|>
+        help="EOS token ID for LLM generation."
+    )
 
     args = parser.parse_args()
 
@@ -168,6 +238,11 @@ def main():
     if needs_audio_pipeline:
         if not all([args.audio_file_path, args.mel_onnx_path, args.speaker_encoder_onnx_path]):
             parser.error("When deriving speaker tokens from audio (either for direct output or for LLM input ID generation without --use_fixed_speaker_tokens), --audio_file_path, --mel_onnx_path, and --speaker_encoder_onnx_path are required.")
+
+    if args.generate_semantic_tokens and not args.llm_onnx_path:
+        parser.error("--llm_onnx_path is required if --generate_semantic_tokens is set.")
+    if args.generate_semantic_tokens and not args.process_for_llm_input_ids:
+        print("Warning: --generate_semantic_tokens is set, but --process_for_llm_input_ids is not. Will proceed but this might not be intended if LLM input_ids are also needed.")
 
     pytorch_device = torch.device('cuda' if args.device == 'cuda' and torch.cuda.is_available() else 'cpu')
 
@@ -342,6 +417,151 @@ def main():
         print(f"LLM Input IDs (from Python HF Tokenizer) for text '{args.text_to_synthesize}':")
         print(llm_tokenized_output)
         print(f"Number of LLM Input IDs: {len(llm_tokenized_output)}")
+
+        if args.generate_semantic_tokens:
+            print("\\\\n--- Generating Semantic Tokens using LLM ONNX ---")
+            if not args.llm_onnx_path:
+                print("Error: --llm_onnx_path not provided. Cannot generate semantic tokens.")
+                return
+
+            try:
+                print(f"Loading LLM ONNX model from: {args.llm_onnx_path}")
+                llm_ort_session = onnxruntime.InferenceSession(args.llm_onnx_path, providers=['CPUExecutionProvider'])
+                print("LLM ONNX model loaded.")
+            except Exception as e:
+                print(f"Error loading LLM ONNX model: {e}")
+                return
+
+            num_llm_layers, num_attention_heads, head_dimension = get_llm_model_dims(llm_ort_session)
+            
+            # Prepare initial inputs for LLM
+            initial_input_ids_np = np.array([llm_tokenized_output], dtype=np.int64) # Batch size 1
+            initial_seq_len = initial_input_ids_np.shape[1]
+            
+            attention_mask_np = np.ones_like(initial_input_ids_np, dtype=np.int64)
+            position_ids_np = np.arange(initial_seq_len, dtype=np.int64).reshape(1, initial_seq_len)
+
+            # Initial past_key_values (empty)
+            batch_size = 1
+            past_kv_inputs = {}
+            for i in range(num_llm_layers):
+                empty_kv_shape = (batch_size, num_attention_heads, 0, head_dimension)
+                empty_kv_tensor = np.empty(empty_kv_shape, dtype=np.float32)
+                past_kv_inputs[f'past_key_values.{i}.key'] = empty_kv_tensor
+                past_kv_inputs[f'past_key_values.{i}.value'] = empty_kv_tensor
+            
+            llm_inputs = {
+                'input_ids': initial_input_ids_np,
+                'attention_mask': attention_mask_np,
+                'position_ids': position_ids_np,
+                **past_kv_inputs
+            }
+            
+            print("Running initial prompt pass through LLM ONNX...")
+            try:
+                llm_outputs_initial_pass = llm_ort_session.run(None, llm_inputs)
+            except Exception as e:
+                print(f"Error during initial LLM ONNX run: {e}")
+                return
+
+            # Output names might vary, inspect or assume standard ones.
+            # Expected outputs: logits, present.0.key, present.0.value, ..., present.N-1.value
+            output_names = [o.name for o in llm_ort_session.get_outputs()]
+            logits_output_name = next((name for name in output_names if "logits" in name), None)
+            if not logits_output_name:
+                print("Error: Could not find 'logits' in LLM ONNX model output names.")
+                return
+
+            logits_idx = output_names.index(logits_output_name)
+            initial_logits = llm_outputs_initial_pass[logits_idx] # Shape: (batch, seq_len, vocab_size)
+            
+            # Prepare past_kv for the generation loop from the initial pass's present_kv
+            current_past_kv = {}
+            for i in range(num_llm_layers):
+                present_key_name = f'present.{i}.key'
+                present_value_name = f'present.{i}.value'
+                if present_key_name in output_names and present_value_name in output_names:
+                    key_idx = output_names.index(present_key_name)
+                    value_idx = output_names.index(present_value_name)
+                    current_past_kv[f'past_key_values.{i}.key'] = llm_outputs_initial_pass[key_idx]
+                    current_past_kv[f'past_key_values.{i}.value'] = llm_outputs_initial_pass[value_idx]
+                else:
+                    print(f"Error: Could not find present K/V for layer {i} in LLM ONNX model output names.")
+                    return
+            
+            # Get the next token from the initial pass (logits of the last token of the prompt)
+            next_token_id = np.argmax(initial_logits[0, -1, :])
+            generated_semantic_tokens = [next_token_id]
+            print(f"Token after initial prompt: {next_token_id}")
+
+            # Auto-regressive generation loop
+            print("Starting auto-regressive generation...")
+            for step in range(args.max_new_semantic_tokens - 1): # -1 because one token already generated
+                if next_token_id == args.llm_eos_token_id:
+                    print(f"EOS token ({args.llm_eos_token_id}) reached at step {step}. Stopping.")
+                    break
+
+                current_input_ids_np = np.array([[next_token_id]], dtype=np.int64) # (1,1)
+                
+                # The past_kv_tensors now have a sequence length from the prompt.
+                # The attention_mask and position_ids need to account for this.
+                past_kv_seq_len = current_past_kv[f'past_key_values.0.key'].shape[2] # (B, Heads, SeqLen, Dim)
+                
+                # Attention mask should cover all past_kv tokens + the current token.
+                current_attention_mask_len = past_kv_seq_len + 1
+                current_attention_mask_np = np.ones((1, current_attention_mask_len), dtype=np.int64)
+                
+                # Position ID for the current token is its absolute position.
+                current_position_id_val = past_kv_seq_len
+                current_position_ids_np = np.array([[current_position_id_val]], dtype=np.int64) # (1,1)
+
+                iter_llm_inputs = {
+                    'input_ids': current_input_ids_np,
+                    'attention_mask': current_attention_mask_np,
+                    'position_ids': current_position_ids_np,
+                    **current_past_kv 
+                }
+                
+                try:
+                    llm_outputs_iter = llm_ort_session.run(None, iter_llm_inputs)
+                except Exception as e:
+                    print(f"Error during LLM ONNX run at generation step {step}: {e}")
+                    break
+                
+                iter_logits = llm_outputs_iter[logits_idx] # Shape (1, 1, vocab_size) for single token input
+                next_token_id = np.argmax(iter_logits[0, 0, :])
+                generated_semantic_tokens.append(next_token_id)
+                # print(f"Step {step}: Generated token {next_token_id}") # Verbose
+
+                # ---- DEBUG: Save logits and print Top-N at the diverging step ----
+                if step == 3: # This is when the 5th token (index 4) is decided
+                    print(f"DEBUG: Processing logits for step {step} (decision for token index 4, which is the 5th token)")
+                    np.save("python_logits_for_5th_token.npy", iter_logits)
+                    print("Saved python_logits_for_5th_token.npy")
+                    
+                    # Get Top-5 logits and their token IDs
+                    current_logits_flat = iter_logits[0, 0, :]
+                    top_n = 5
+                    top_n_indices = np.argsort(current_logits_flat)[-top_n:][::-1] # Get indices of top N, then reverse for descending order
+                    top_n_values = current_logits_flat[top_n_indices]
+                    
+                    print(f"Python Top-{top_n} Logits for 5th token decision:")
+                    for i in range(top_n):
+                        print(f"  Rank {i+1}: Token ID = {top_n_indices[i]}, Logit = {top_n_values[i]:.8f}")
+                # ---- END DEBUG ----
+
+                # Update past_kv for next iteration
+                for i in range(num_llm_layers):
+                    present_key_name = f'present.{i}.key'
+                    present_value_name = f'present.{i}.value'
+                    key_idx = output_names.index(present_key_name)
+                    value_idx = output_names.index(present_value_name)
+                    current_past_kv[f'past_key_values.{i}.key'] = llm_outputs_iter[key_idx]
+                    current_past_kv[f'past_key_values.{i}.value'] = llm_outputs_iter[value_idx]
+
+            print("\\\\n--- Generated Semantic Tokens (Python ONNX) ---")
+            print(f"Number of generated semantic tokens: {len(generated_semantic_tokens)}")
+            print(generated_semantic_tokens)
 
 if __name__ == "__main__":
     main() 

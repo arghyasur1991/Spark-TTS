@@ -237,6 +237,15 @@ class SparkTTS:
             [f"<|bicodec_global_{i}|>" for i in global_token_ids.squeeze()]
         )
 
+        # Save Speaker Encoder Output (Global Tokens as int64)
+        speaker_encoder_output_path = "python_speaker_encoder_output_tokens_int64.npy"
+        try:
+            # global_token_ids are expected to be torch.long (int64)
+            np.save(speaker_encoder_output_path, global_token_ids.cpu().numpy())
+            print(f"Saved Speaker Encoder output (int64) to {speaker_encoder_output_path} (Shape: {global_token_ids.shape})")
+        except Exception as e:
+            print(f"Error saving {speaker_encoder_output_path}: {e}")
+
         if prompt_text is not None:
             semantic_tokens = "".join(
                 [f"<|bicodec_semantic_{i}|>" for i in semantic_token_ids.squeeze()]
@@ -348,6 +357,14 @@ class SparkTTS:
                 text, prompt_speech_path, prompt_text
             )
             
+        print(f"--- DEBUG PYTHON TOKENIZER ---")
+        print(f"Prompt string being tokenized by HF Tokenizer: '{prompt}'")
+        temp_tokens = self.tokenizer.tokenize(prompt)
+        temp_ids = self.tokenizer.convert_tokens_to_ids(temp_tokens)
+        print(f"Tokens from HF tokenizer: {temp_tokens}")
+        print(f"IDs from HF tokenizer: {temp_ids}")
+        print(f"-----------------------------")
+            
         model_inputs = self.tokenizer([prompt], return_tensors="pt").to(self.device)
         return model_inputs, global_token_ids
 
@@ -437,12 +454,25 @@ class SparkTTS:
             if collect_timing:
                 tokenization_start = time.time()
                 
-            model_inputs, global_token_ids = self.tokenize_inputs(
+            model_inputs_tuple = self.tokenize_inputs(
                 text, prompt_speech_path, prompt_text, gender, pitch, speed
             )
+            model_inputs = model_inputs_tuple[0] # Actual model_inputs tensor
+            if global_token_ids is None: # If not passed in, get it from tokenize_inputs
+                 global_token_ids = model_inputs_tuple[1]
             
             if collect_timing:
                 timing_data["tokenization_time"] = time.time() - tokenization_start
+        
+        # Save LLM Input IDs
+        llm_input_ids_path = "python_llm_input_ids.npy"
+        try:
+            # model_inputs.input_ids are usually torch.long (int64)
+            # Assuming batch size 1 for saving, so take [0]
+            np.save(llm_input_ids_path, model_inputs.input_ids[0].cpu().numpy())
+            print(f"Saved LLM input_ids to {llm_input_ids_path} (Shape: {model_inputs.input_ids[0].shape})")
+        except Exception as e:
+            print(f"Error saving {llm_input_ids_path}: {e}")
 
         if collect_timing:
             generation_start = time.time()
@@ -478,8 +508,32 @@ class SparkTTS:
             timing_data["model_generation_time"] = time.time() - generation_start
             token_extraction_start = time.time()
 
+        # Save LLM Raw Output Token IDs
+        llm_raw_output_path = "python_llm_output_raw_token_ids.npy"
+        generated_ids_stripped_for_saving = [
+            output_ids[len(input_ids) :] # Strip prompt from output_ids
+            for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+        ]
+        try:
+            if generated_ids_stripped_for_saving and len(generated_ids_stripped_for_saving[0]) > 0:
+                # Save the first element of the stripped list (assuming batch size 1)
+                # Ensure it's int64 as C# NpyLoader expects for this file in the test
+                save_data = generated_ids_stripped_for_saving[0].cpu().numpy().astype(np.int64)
+                np.save(llm_raw_output_path, save_data)
+                print(f"Saved LLM raw output tokens (stripped) to {llm_raw_output_path} (Shape: {save_data.shape}, Dtype: {save_data.dtype})")
+            elif generated_ids and len(generated_ids[0]) > 0 : # Fallback to save unstripped if stripping resulted in empty or error
+                print(f"Warning: Stripped generated_ids for saving are empty. Saving unstripped generated_ids[0] to {llm_raw_output_path}")
+                save_data_unstripped = generated_ids[0].cpu().numpy().astype(np.int64)
+                np.save(llm_raw_output_path, save_data_unstripped)
+                print(f"Saved LLM raw output tokens (unstripped) to {llm_raw_output_path} (Shape: {save_data_unstripped.shape}, Dtype: {save_data_unstripped.dtype})")
+            else:
+                print(f"Skipping save of {llm_raw_output_path} as generated_ids (or its stripped version) is empty or not as expected.")
+        except Exception as e:
+            print(f"Error saving {llm_raw_output_path}: {e}")
+
+        # Original stripping logic for subsequent processing in Python:
         generated_ids = [
-            output_ids[len(input_ids) :]
+            output_ids[len(input_ids) :] 
             for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
         ]
 
@@ -516,9 +570,20 @@ class SparkTTS:
                     onnx_input_names[1]: onnx_global_tokens_np
                 }
                 
+                # Save vocoder inputs (already here, just confirming names)
+                print(f"Saving ONNX vocoder input semantic_tokens to onnx_vocoder_input_semantic_tokens.npy (Shape: {onnx_semantic_tokens_np.shape}, Dtype: {onnx_semantic_tokens_np.dtype})")
+                np.save("onnx_vocoder_input_semantic_tokens.npy", onnx_semantic_tokens_np)
+                print(f"Saving ONNX vocoder input global_tokens to onnx_vocoder_input_global_tokens.npy (Shape: {onnx_global_tokens_np.shape}, Dtype: {onnx_global_tokens_np.dtype})")
+                np.save("onnx_vocoder_input_global_tokens.npy", onnx_global_tokens_np)
+                
                 ort_outputs = self.onnx_bicodec_vocoder_session.run(None, ort_inputs)
                 wav = ort_outputs[0]
                 print(f"ONNX BiCodec vocoder generated audio of shape: {wav.shape}")
+
+                # Save vocoder output (Rename this file)
+                python_waveform_output_path = "python_output_waveform.npy"
+                print(f"Saving vocoder output waveform to {python_waveform_output_path} (Shape: {wav.shape}, Dtype: {wav.dtype})")
+                np.save(python_waveform_output_path, wav)
 
                 if wav.ndim == 3:
                     if wav.shape[0] == 1 and wav.shape[1] == 1:
@@ -535,6 +600,20 @@ class SparkTTS:
                     global_token_ids.to(self.device).squeeze(0),
                     pred_semantic_ids.to(self.device),
                 )
+            # Save PyTorch vocoder output if this path is taken
+            python_waveform_output_path = "python_output_waveform.npy"
+            try:
+                # Ensure wav is a numpy array on CPU before saving
+                if isinstance(wav, torch.Tensor):
+                    wav_np = wav.cpu().numpy()
+                elif isinstance(wav, np.ndarray):
+                    wav_np = wav
+                else:
+                    raise TypeError(f"Unsupported type for wav: {type(wav)}")
+                print(f"Saving PyTorch vocoder output waveform to {python_waveform_output_path} (Shape: {wav_np.shape}, Dtype: {wav_np.dtype})")
+                np.save(python_waveform_output_path, wav_np)
+            except Exception as e:
+                print(f"Error saving PyTorch vocoder output to {python_waveform_output_path}: {e}")
         else:
             if self.use_bicodec_onnx and not self.onnx_bicodec_vocoder_session:
                 print("Attempted to use ONNX BiCodec vocoder, but session not loaded. Using PyTorch version.")
@@ -542,6 +621,20 @@ class SparkTTS:
                 global_token_ids.to(self.device).squeeze(0),
                 pred_semantic_ids.to(self.device),
             )
+            # Save PyTorch vocoder output if this path is taken
+            python_waveform_output_path = "python_output_waveform.npy"
+            try:
+                # Ensure wav is a numpy array on CPU before saving
+                if isinstance(wav, torch.Tensor):
+                    wav_np = wav.cpu().numpy()
+                elif isinstance(wav, np.ndarray):
+                    wav_np = wav
+                else:
+                    raise TypeError(f"Unsupported type for wav: {type(wav)}")
+                print(f"Saving PyTorch vocoder output waveform to {python_waveform_output_path} (Shape: {wav_np.shape}, Dtype: {wav_np.dtype})")
+                np.save(python_waveform_output_path, wav_np)
+            except Exception as e:
+                print(f"Error saving PyTorch vocoder output to {python_waveform_output_path}: {e}")
         
         if collect_timing:
             timing_data["audio_conversion_time"] = time.time() - audio_conversion_start
