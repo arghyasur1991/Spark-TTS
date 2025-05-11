@@ -41,7 +41,7 @@ class SimpleFeatMimic:
 class BiCodecTokenizer:
     """BiCodec tokenizer for handling audio input and tokenization."""
 
-    def __init__(self, model_dir: Path, device: torch.device = None, use_onnx_wav2vec2: bool = False, use_speaker_encoder_tokenizer_onnx: bool = False, onnx_speaker_encoder_tokenizer_session=None, **kwargs):
+    def __init__(self, model_dir: Path, device: torch.device = None, use_onnx_wav2vec2: bool = False, use_speaker_encoder_tokenizer_onnx: bool = False, onnx_speaker_encoder_tokenizer_session=None, use_mel_spectrogram_onnx: bool = False, **kwargs):
         super().__init__()
         """
         Args:
@@ -50,12 +50,15 @@ class BiCodecTokenizer:
             use_onnx_wav2vec2 (bool): Whether to use ONNX for Wav2Vec2 feature extraction.
             use_speaker_encoder_tokenizer_onnx (bool): Whether to use ONNX for Speaker Encoder tokenizer.
             onnx_speaker_encoder_tokenizer_session: Pre-loaded ONNX session for Speaker Encoder.
+            use_mel_spectrogram_onnx (bool): Whether to use ONNX for Mel Spectrogram generation.
         """
         self.original_device = device
         self.use_onnx_wav2vec2 = use_onnx_wav2vec2
         self.use_speaker_encoder_tokenizer_onnx = use_speaker_encoder_tokenizer_onnx
         self.onnx_speaker_encoder_tokenizer_session = onnx_speaker_encoder_tokenizer_session
+        self.use_mel_spectrogram_onnx = use_mel_spectrogram_onnx
         self.onnx_feature_extractor_session = None
+        self.onnx_mel_spectrogram_session = None
         
         # For MPS devices, we'll use CPU for the model to avoid unsupported operations
         if device is not None and device.type == "mps":
@@ -70,10 +73,32 @@ class BiCodecTokenizer:
 
     def _initialize_model(self):
         """Load and initialize the BiCodec model and Wav2Vec2 feature extractor."""
+        # Load ONNX Mel Spectrogram session if enabled
+        if self.use_mel_spectrogram_onnx:
+            if onnxruntime is None:
+                print("WARNING: use_mel_spectrogram_onnx is True, but onnxruntime library is not found. Falling back to PyTorch MelSpectrogram.")
+                self.use_mel_spectrogram_onnx = False
+            else:
+                onnx_mel_model_path_str = "onnx_models/mel_spectrogram.onnx"
+                if not os.path.exists(onnx_mel_model_path_str):
+                    print(f"WARNING: ONNX model for MelSpectrogram not found at {onnx_mel_model_path_str}. Falling back to PyTorch MelSpectrogram.")
+                    self.use_mel_spectrogram_onnx = False
+                else:
+                    try:
+                        # TODO: User might want to specify providers
+                        self.onnx_mel_spectrogram_session = onnxruntime.InferenceSession(onnx_mel_model_path_str)
+                        print(f"Successfully loaded ONNX MelSpectrogram from {onnx_mel_model_path_str}")
+                    except Exception as e:
+                        print(f"ERROR: Failed to load ONNX MelSpectrogram model: {e}. Falling back to PyTorch MelSpectrogram.")
+                        self.use_mel_spectrogram_onnx = False
+                        self.onnx_mel_spectrogram_session = None
+
         self.model = BiCodec.load_from_checkpoint(
             f"{self.model_dir}/BiCodec",
             use_speaker_encoder_tokenizer_onnx=self.use_speaker_encoder_tokenizer_onnx,
-            onnx_speaker_encoder_tokenizer_session=self.onnx_speaker_encoder_tokenizer_session
+            onnx_speaker_encoder_tokenizer_session=self.onnx_speaker_encoder_tokenizer_session,
+            use_mel_spectrogram_onnx=self.use_mel_spectrogram_onnx,
+            onnx_mel_spectrogram_session=self.onnx_mel_spectrogram_session
         ).to(self.device)
         self.processor = Wav2Vec2FeatureExtractor.from_pretrained(
             f"{self.model_dir}/wav2vec2-large-xlsr-53"
@@ -121,7 +146,10 @@ class BiCodecTokenizer:
             # Repeat and truncate to handle insufficient length
             wav = np.tile(wav, ref_segment_length // wav_length + 1)
 
-        return wav[:ref_segment_length]
+        # Ensure wav_ref has shape (1, 1, T_audio) for consistent processing
+        wav_ref_np = wav[:ref_segment_length]
+        wav_ref = torch.from_numpy(wav_ref_np).unsqueeze(0).unsqueeze(0).float()
+        return wav, wav_ref
 
     def process_audio(self, wav_path: Path) -> Tuple[np.ndarray, torch.Tensor]:
         """load auido and get reference audio from wav path"""
@@ -131,13 +159,15 @@ class BiCodecTokenizer:
             volume_normalize=self.config["volume_normalize"],
         )
 
-        wav_ref = self.get_ref_clip(wav)
+        wav, wav_ref = self.get_ref_clip(wav)
 
-        wav_ref = torch.from_numpy(wav_ref).unsqueeze(0).float()
         return wav, wav_ref
 
     def extract_wav2vec2_features(self, wavs: torch.Tensor) -> torch.Tensor:
         """extract wav2vec2 features"""
+        # Add diagnostic print for the input wavs shape
+        print(f"[BiCodecTokenizer.extract_wav2vec2_features] Input wavs shape: {wavs.shape}, dtype: {wavs.dtype}")
+
         inputs = self.processor(
             wavs,
             sampling_rate=16000,
@@ -145,13 +175,25 @@ class BiCodecTokenizer:
             padding=True,
         ).input_values
         
+        # Add diagnostic print for the shape of 'inputs' from the processor
+        print(f"[BiCodecTokenizer.extract_wav2vec2_features] Shape of inputs after processor: {inputs.shape}, dtype: {inputs.dtype}")
+
         inputs = inputs.to(self.device)
 
         if self.use_onnx_wav2vec2 and self.onnx_feature_extractor_session:
+            # Ensure input for ONNX is 2D (B, T)
+            if inputs.ndim == 3 and inputs.shape[1] == 1: # Squeeze the channel dim if present
+                print(f"[BiCodecTokenizer.extract_wav2vec2_features] Squeezing inputs for ONNX from {inputs.shape} to 2D.")
+                inputs_for_onnx = inputs.squeeze(1)
+            else:
+                inputs_for_onnx = inputs
+            
+            print(f"[BiCodecTokenizer.extract_wav2vec2_features] Shape of inputs_for_onnx (to numpy): {inputs_for_onnx.shape}")
+
             onnx_input_name = self.onnx_feature_extractor_session.get_inputs()[0].name
             
             # ONNX Runtime expects numpy arrays on CPU
-            onnx_inputs_np = inputs.cpu().numpy()
+            onnx_inputs_np = inputs_for_onnx.cpu().numpy()
             
             # Run ONNX inference
             # Assumes onnx_outputs is a list of numpy arrays, each being a hidden state tensor
@@ -204,13 +246,22 @@ class BiCodecTokenizer:
     def tokenize(self, audio_path: str) -> Tuple[torch.Tensor, torch.Tensor]:
         """tokenize the audio"""
         wav, ref_wav = self.process_audio(audio_path)
-        feat = self.extract_wav2vec2_features(wav)
+        # wav is numpy array, ref_wav is already a tensor (1, 1, T_audio)
         
-        # Move data to model's device (CPU if MPS was detected in __init__)
+        # Ensure wav_for_feat has shape (B, T_audio) for Wav2Vec2FeatureExtractor
+        # For feature_extractor, input should be raw audio (B, T_audio)
+        wav_for_feat_extraction = torch.from_numpy(wav).unsqueeze(0).float()
+        feat = self.extract_wav2vec2_features(wav_for_feat_extraction)
+        
+        # Ensure batch["wav"] for BiCodec.tokenize (for ONNX mel) has shape (B, 1, T_audio)
+        # This is the raw waveform that will be passed to _compute_mel_spectrogram via BiCodec.tokenize
+        wav_for_bicodec_mel = torch.from_numpy(wav).unsqueeze(0).unsqueeze(0).float().to(self.device)
+        
+        # ref_wav is already (1, 1, T_audio) and float from process_audio
         batch = {
-            "wav": torch.from_numpy(wav).unsqueeze(0).float().to(self.device),
-            "ref_wav": ref_wav.to(self.device),
-            "feat": feat.to(self.device),
+            "wav": wav_for_bicodec_mel, # This is for the mel spectrogram part inside BiCodec
+            "ref_wav": ref_wav.to(self.device), # This is also for mel spec, specifically for speaker encoding path
+            "feat": feat.to(self.device), # This is for the BiCodec encoder
         }
         
         semantic_tokens, global_tokens = self.model.tokenize(batch)

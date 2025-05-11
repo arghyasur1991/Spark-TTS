@@ -51,6 +51,7 @@ class SparkTTS:
         use_bicodec_onnx: bool = False,
         use_speaker_encoder_tokenizer_onnx: bool = False,
         use_llm_onnx: bool = False,
+        use_mel_spectrogram_onnx: bool = False,
     ):
         """
         Initializes the SparkTTS model with the provided configurations and device.
@@ -65,6 +66,7 @@ class SparkTTS:
             use_bicodec_onnx (bool, optional): Whether to use ONNX for BiCodec vocoder inference.
             use_speaker_encoder_tokenizer_onnx (bool, optional): Whether to use ONNX for Speaker Encoder tokenizer.
             use_llm_onnx (bool, optional): Whether to use ONNX for LLM inference.
+            use_mel_spectrogram_onnx (bool, optional): Whether to use ONNX for Mel Spectrogram generation.
         """
         self.device = device
         self.model_dir = model_dir
@@ -77,6 +79,7 @@ class SparkTTS:
         self.use_bicodec_onnx = use_bicodec_onnx
         self.use_speaker_encoder_tokenizer_onnx = use_speaker_encoder_tokenizer_onnx
         self.use_llm_onnx = use_llm_onnx
+        self.use_mel_spectrogram_onnx = use_mel_spectrogram_onnx
         self.onnx_bicodec_vocoder_session = None
         self.onnx_speaker_encoder_tokenizer_session = None
         self.onnx_llm_model = None
@@ -144,13 +147,14 @@ class SparkTTS:
                     print("✗ torch.compile not available for PyTorch model - requires PyTorch 2.0+")
             print("✓ PyTorch LLM initialized.")
         
-        print(f"Initializing BiCodecTokenizer with use_onnx_wav2vec2={self.use_wav2vec2_onnx}, use_speaker_encoder_tokenizer_onnx={self.use_speaker_encoder_tokenizer_onnx}")
+        print(f"Initializing BiCodecTokenizer with use_onnx_wav2vec2={self.use_wav2vec2_onnx}, use_speaker_encoder_tokenizer_onnx={self.use_speaker_encoder_tokenizer_onnx}, use_mel_spectrogram_onnx={self.use_mel_spectrogram_onnx}")
         self.audio_tokenizer = BiCodecTokenizer(
             self.model_dir, 
             device=self.device,
             use_onnx_wav2vec2=self.use_wav2vec2_onnx,
             use_speaker_encoder_tokenizer_onnx=self.use_speaker_encoder_tokenizer_onnx,
-            onnx_speaker_encoder_tokenizer_session=self.onnx_speaker_encoder_tokenizer_session
+            onnx_speaker_encoder_tokenizer_session=self.onnx_speaker_encoder_tokenizer_session,
+            use_mel_spectrogram_onnx=self.use_mel_spectrogram_onnx
         )
         print("==== Model Initialization Complete ====\n")
 
@@ -189,7 +193,8 @@ class SparkTTS:
                         device=self.device,
                         use_onnx_wav2vec2=self.use_wav2vec2_onnx,
                         use_speaker_encoder_tokenizer_onnx=self.use_speaker_encoder_tokenizer_onnx,
-                        onnx_speaker_encoder_tokenizer_session=self.onnx_speaker_encoder_tokenizer_session
+                        onnx_speaker_encoder_tokenizer_session=self.onnx_speaker_encoder_tokenizer_session,
+                        use_mel_spectrogram_onnx=self.use_mel_spectrogram_onnx
                     )
                 except Exception as e:
                     print(f"✗ Failed to load ONNX Speaker Encoder Tokenizer: {e}")

@@ -54,6 +54,7 @@ use_wav2vec2_onnx=true # Set to true to test ONNX, false for PyTorch
 use_bicodec_onnx_model=true  # Set to true to use ONNX for BiCodec Vocoder
 use_speaker_encoder_tokenizer_onnx=true  # Set to true to use ONNX for Speaker Encoder Tokenizer
 use_llm_onnx=true # New flag for ONNX LLM
+use_mel_spectrogram_onnx=true # New flag for ONNX Mel Spectrogram, default to false
 # ----------------------------- #
 
 # Change directory to the root directory
@@ -82,6 +83,7 @@ echo "  - Use Wav2Vec2 ONNX: $use_wav2vec2_onnx"
 echo "  - Use BiCodec ONNX: $use_bicodec_onnx_model"
 echo "  - Use Speaker Encoder Tokenizer ONNX: $use_speaker_encoder_tokenizer_onnx"
 echo "  - Use LLM ONNX: $use_llm_onnx"
+echo "  - Use Mel Spectrogram ONNX: $use_mel_spectrogram_onnx"
 echo
 
 # Set up additional arguments
@@ -111,6 +113,9 @@ if [ "$use_speaker_encoder_tokenizer_onnx" = true ]; then
 fi
 if [ "$use_llm_onnx" = true ]; then
   onnx_arg="$onnx_arg --use_llm_onnx"
+fi
+if [ "$use_mel_spectrogram_onnx" = true ]; then
+  onnx_arg="$onnx_arg --use_mel_spectrogram_onnx"
 fi
 
 echo -e "${GREEN}Starting inference...${NC}"

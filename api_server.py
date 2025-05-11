@@ -63,6 +63,7 @@ USE_WAV2VEC2_ONNX = get_bool_env_var("USE_WAV2VEC2_ONNX", True)
 USE_BICODEC_ONNX = get_bool_env_var("USE_BICODEC_ONNX", True)
 USE_SPEAKER_ENCODER_TOKENIZER_ONNX = get_bool_env_var("USE_SPEAKER_ENCODER_TOKENIZER_ONNX", True)
 USE_LLM_ONNX = get_bool_env_var("USE_LLM_ONNX", True)
+USE_MEL_SPECTROGRAM_ONNX = get_bool_env_var("USE_MEL_SPECTROGRAM_ONNX", False)
 
 # PyTorch specific configurations from Environment Variables (optional)
 PT_QUANTIZATION = os.getenv("PT_QUANTIZATION", "none") # none, fp16, int8
@@ -132,6 +133,7 @@ def initialize_model():
         logger.info(f"  USE_BICODEC_ONNX: {USE_BICODEC_ONNX} (from env var USE_BICODEC_ONNX)")
         logger.info(f"  USE_SPEAKER_ENCODER_TOKENIZER_ONNX: {USE_SPEAKER_ENCODER_TOKENIZER_ONNX} (from env var USE_SPEAKER_ENCODER_TOKENIZER_ONNX)")
         logger.info(f"  USE_LLM_ONNX: {USE_LLM_ONNX} (from env var USE_LLM_ONNX)")
+        logger.info(f"  USE_MEL_SPECTROGRAM_ONNX: {USE_MEL_SPECTROGRAM_ONNX} (from env var USE_MEL_SPECTROGRAM_ONNX)")
         logger.info("  --- PyTorch Specific Settings (if applicable) ---")
         logger.info(f"  PT_QUANTIZATION: {PT_QUANTIZATION} (from env var PT_QUANTIZATION)")
         logger.info(f"  PT_USE_COMPILE: {PT_USE_COMPILE} (from env var PT_USE_COMPILE)")
@@ -147,7 +149,8 @@ def initialize_model():
             use_wav2vec2_onnx=USE_WAV2VEC2_ONNX,
             use_bicodec_onnx=USE_BICODEC_ONNX,
             use_speaker_encoder_tokenizer_onnx=USE_SPEAKER_ENCODER_TOKENIZER_ONNX,
-            use_llm_onnx=USE_LLM_ONNX
+            use_llm_onnx=USE_LLM_ONNX,
+            use_mel_spectrogram_onnx=USE_MEL_SPECTROGRAM_ONNX
         )
     return TTS_MODEL
 
