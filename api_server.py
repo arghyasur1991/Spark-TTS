@@ -63,7 +63,7 @@ USE_WAV2VEC2_ONNX = get_bool_env_var("USE_WAV2VEC2_ONNX", True)
 USE_BICODEC_ONNX = get_bool_env_var("USE_BICODEC_ONNX", True)
 USE_SPEAKER_ENCODER_TOKENIZER_ONNX = get_bool_env_var("USE_SPEAKER_ENCODER_TOKENIZER_ONNX", True)
 USE_LLM_ONNX = get_bool_env_var("USE_LLM_ONNX", True)
-USE_MEL_SPECTROGRAM_ONNX = get_bool_env_var("USE_MEL_SPECTROGRAM_ONNX", False)
+USE_MEL_SPECTROGRAM_ONNX = get_bool_env_var("USE_MEL_SPECTROGRAM_ONNX", True)
 
 # PyTorch specific configurations from Environment Variables (optional)
 PT_QUANTIZATION = os.getenv("PT_QUANTIZATION", "none") # none, fp16, int8
