@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Dict, Any
 from omegaconf import DictConfig
 from safetensors.torch import load_file
-import numpy as np
 
 from sparktts.utils.file import load_config
 from sparktts.modules.speaker.speaker_encoder import SpeakerEncoder
@@ -148,15 +147,6 @@ class BiCodec(nn.Module):
             print("BiCodec: Using ONNX MelSpectrogram.")
             try:
                 wav_np = wav_tensor.cpu().numpy() # Ensure it's on CPU for ONNX
-                
-                # Save the input wav that produced this mel (already done in previous step by user request)
-                # try:
-                #     save_path_input_wav = "python_audio_for_mel_onnx.npy" # Matches existing save
-                #     np.save(save_path_input_wav, wav_np)
-                #     print(f"BiCodec: (Re)Saved input wav_tensor (as wav_np) to {save_path_input_wav} (Shape: {wav_np.shape}, Dtype: {wav_np.dtype})")
-                # except Exception as e_save_input_wav:
-                #     print(f"BiCodec: ✗ Error saving input wav_np: {e_save_input_wav}")
-
                 onnx_input_name = self.onnx_mel_spectrogram_session.get_inputs()[0].name
                 onnx_inputs = {onnx_input_name: wav_np}
                 mel_np = self.onnx_mel_spectrogram_session.run(None, onnx_inputs)[0]
@@ -164,52 +154,18 @@ class BiCodec(nn.Module):
                 # Output from ONNX wrapper is (B, N_mels, T_mel)
                 mel_tensor_from_onnx = torch.from_numpy(mel_np).to(wav_tensor.device) # Move back to original device
                 print(f"BiCodec: ONNX Mel output converted to tensor shape: {mel_tensor_from_onnx.shape}, dtype: {mel_tensor_from_onnx.dtype}") # Diagnostic
-
-                # --- BEGIN MODIFICATION: Save raw ONNX mel output ---
-                try:
-                    save_path_raw_mel = "python_raw_mel_output.npy"
-                    # mel_tensor_from_onnx is already (B, N_mels, T_mel)
-                    raw_mel_np_to_save = mel_tensor_from_onnx.cpu().numpy()
-                    np.save(save_path_raw_mel, raw_mel_np_to_save)
-                    print(f"BiCodec: Saved raw ONNX mel output to {save_path_raw_mel} (Shape: {raw_mel_np_to_save.shape}, Dtype: {raw_mel_np_to_save.dtype})")
-                except Exception as e_save_raw_mel:
-                    print(f"BiCodec: ✗ Error saving raw ONNX mel output: {e_save_raw_mel}")
-                # --- END MODIFICATION ---
-
                 return mel_tensor_from_onnx
             except Exception as e:
                 print(f"BiCodec: ✗ Error using ONNX MelSpectrogram: {e}. Falling back to PyTorch.")
                 # Fallback to PyTorch method
-                mel_output_pytorch = self.mel_transformer(wav_tensor) # PyTorch output: (B, 1, N_mels, T_mel)
-                raw_mel_pytorch_squeezed = mel_output_pytorch.squeeze(1) # Return (B, N_mels, T_mel)
-                
-                # --- BEGIN MODIFICATION: Save raw PyTorch mel output (in fallback) ---
-                try:
-                    save_path_raw_mel_pt_fb = "python_raw_mel_output.npy"
-                    raw_mel_pt_fb_np_to_save = raw_mel_pytorch_squeezed.cpu().numpy()
-                    np.save(save_path_raw_mel_pt_fb, raw_mel_pt_fb_np_to_save)
-                    print(f"BiCodec: Saved raw PyTorch (fallback) mel output to {save_path_raw_mel_pt_fb} (Shape: {raw_mel_pt_fb_np_to_save.shape}, Dtype: {raw_mel_pt_fb_np_to_save.dtype})")
-                except Exception as e_save_raw_mel_pt_fb:
-                    print(f"BiCodec: ✗ Error saving raw PyTorch (fallback) mel output: {e_save_raw_mel_pt_fb}")
-                # --- END MODIFICATION ---
-                return raw_mel_pytorch_squeezed
+                mel_output = self.mel_transformer(wav_tensor) # PyTorch output: (B, 1, N_mels, T_mel)
+                return mel_output.squeeze(1) # Return (B, N_mels, T_mel)
         else:
             if self.use_mel_spectrogram_onnx:
                  print("BiCodec: ONNX MelSpectrogram session not available. Using PyTorch MelSpectrogram.")
             # PyTorch logic
-            mel_output_pytorch = self.mel_transformer(wav_tensor) # PyTorch output: (B, 1, N_mels, T_mel)
-            raw_mel_pytorch_squeezed = mel_output_pytorch.squeeze(1) # Result is (B, N_mels, T_mel)
-
-            # --- BEGIN MODIFICATION: Save raw PyTorch mel output (main PyTorch path) ---
-            try:
-                save_path_raw_mel_pt = "python_raw_mel_output.npy"
-                raw_mel_pt_np_to_save = raw_mel_pytorch_squeezed.cpu().numpy()
-                np.save(save_path_raw_mel_pt, raw_mel_pt_np_to_save)
-                print(f"BiCodec: Saved raw PyTorch mel output to {save_path_raw_mel_pt} (Shape: {raw_mel_pt_np_to_save.shape}, Dtype: {raw_mel_pt_np_to_save.dtype})")
-            except Exception as e_save_raw_mel_pt:
-                print(f"BiCodec: ✗ Error saving raw PyTorch mel output: {e_save_raw_mel_pt}")
-            # --- END MODIFICATION ---
-            return raw_mel_pytorch_squeezed
+            mel_output = self.mel_transformer(wav_tensor) # PyTorch output: (B, 1, N_mels, T_mel)
+            return mel_output.squeeze(1) # Return (B, N_mels, T_mel)
 
     def forward(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -292,16 +248,6 @@ class BiCodec(nn.Module):
                 # mel_for_onnx is currently (B, F_mel, T_mel), so it needs to be permuted.
                 mels_np = mel_for_onnx.permute(0, 2, 1).contiguous().cpu().numpy()
                 print(f"BiCodec: Shape of mels_np for ONNX input (should be B, T, F): {mels_np.shape}") # Debug print for permuted shape
-                
-                # --- BEGIN MODIFICATION: Save mels_np ---
-                try:
-                    save_path_onnx_mel_se = "python_mel_for_speaker_encoder.npy"
-                    np.save(save_path_onnx_mel_se, mels_np)
-                    print(f"BiCodec: Saved ONNX-path mel_for_speaker_encoder to {save_path_onnx_mel_se} (Shape: {mels_np.shape}, Dtype: {mels_np.dtype})")
-                except Exception as e_save_onnx_mel_se:
-                    print(f"BiCodec: ✗ Error saving ONNX-path mel_for_speaker_encoder: {e_save_onnx_mel_se}")
-                # --- END MODIFICATION ---
-
                 onnx_inputs = {'mel_spectrogram': mels_np}
                 
                 global_tokens_np = self.onnx_speaker_encoder_tokenizer_session.run(None, onnx_inputs)[0]
@@ -318,16 +264,6 @@ class BiCodec(nn.Module):
                      mel_for_pytorch_encoder = mel_for_speaker_encoder_full.contiguous() # Ensure contiguous
                 else: # Corrected fallback logic
                     raise ValueError(f"Unexpected number of mel channels for PyTorch SpeakerEncoder (fallback): {mel_for_speaker_encoder_full.shape[1]}. Expected 128 or 301 to slice.") # Corrected from shape[0]
-                
-                # --- BEGIN MODIFICATION: Save PyTorch-path mel for SE ---
-                try:
-                    pyt_mel_for_se_input_fallback = mel_for_pytorch_encoder.transpose(1, 2).contiguous().cpu().numpy()
-                    save_path_pyt_mel_se_fallback = "python_mel_for_speaker_encoder.npy"
-                    np.save(save_path_pyt_mel_se_fallback, pyt_mel_for_se_input_fallback)
-                    print(f"BiCodec: Saved PyTorch-fallback-path mel_for_speaker_encoder to {save_path_pyt_mel_se_fallback} (Shape: {pyt_mel_for_se_input_fallback.shape}, Dtype: {pyt_mel_for_se_input_fallback.dtype})")
-                except Exception as e_save_pyt_mel_se_fallback:
-                    print(f"BiCodec: ✗ Error saving PyTorch-fallback-path mel_for_speaker_encoder: {e_save_pyt_mel_se_fallback}")
-                # --- END MODIFICATION ---
                 global_tokens = self.speaker_encoder.tokenize(mel_for_pytorch_encoder.transpose(1, 2))
         else:
             if self.use_speaker_encoder_tokenizer_onnx:
@@ -344,16 +280,6 @@ class BiCodec(nn.Module):
                 mel_for_pytorch_encoder = mel_for_speaker_encoder_full.contiguous() # Ensure contiguous
             else:
                  raise ValueError(f"Unexpected number of mel channels for PyTorch SpeakerEncoder: {mel_for_speaker_encoder_full.shape[1]}. Expected 128 or 301 to slice.") # Corrected from shape[0]
-            
-            # --- BEGIN MODIFICATION: Save PyTorch-path mel for SE ---
-            try:
-                pyt_mel_for_se_input = mel_for_pytorch_encoder.transpose(1, 2).contiguous().cpu().numpy()
-                save_path_pyt_mel_se = "python_mel_for_speaker_encoder.npy"
-                np.save(save_path_pyt_mel_se, pyt_mel_for_se_input)
-                print(f"BiCodec: Saved PyTorch-path mel_for_speaker_encoder to {save_path_pyt_mel_se} (Shape: {pyt_mel_for_se_input.shape}, Dtype: {pyt_mel_for_se_input.dtype})")
-            except Exception as e_save_pyt_mel_se:
-                print(f"BiCodec: ✗ Error saving PyTorch-path mel_for_speaker_encoder: {e_save_pyt_mel_se}")
-            # --- END MODIFICATION ---
             global_tokens = self.speaker_encoder.tokenize(mel_for_pytorch_encoder.transpose(1, 2))
 
         return semantic_tokens, global_tokens
