@@ -113,66 +113,65 @@ class MelSpectrogramCalculator(torch.nn.Module):
         return mel_output
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract Speaker Tokens from an audio file using ONNX.")
+    parser = argparse.ArgumentParser(description="Extract Speaker Tokens from an audio file using ONNX for both Mel and Speaker Encoding.")
     parser.add_argument(
         "--model_base_dir", 
         type=str, 
         required=True,
-        help="Path to the base SparkTTS model directory (e.g., pretrained_models/Spark-TTS-0.5B). Should contain BiCodec/config.yaml."
+        help="Path to the base SparkTTS model directory (e.g., pretrained_models/Spark-TTS-0.5B). Should contain BiCodec/config.yaml for target_sample_rate."
+    )
+    parser.add_argument(
+        "--mel_onnx_path",
+        type=str,
+        required=True,
+        help="Path to the Mel Spectrogram ONNX model."
     )
     parser.add_argument(
         "--speaker_encoder_onnx_path", 
         type=str, 
         required=True, 
-        help="Path to the Speaker Encoder Tokenizer ONNX model (e.g., ./onnx_models/speaker_encoder_tokenizer.onnx)."
+        help="Path to the Speaker Encoder Tokenizer ONNX model."
     )
     parser.add_argument(
         "--audio_file_path", 
         type=str, 
         required=True, 
-        help="Path to the input audio WAV file for speaker encoding."
+        help="Path to the input audio WAV file."
     )
-    parser.add_argument("--device", type=str, default="cpu", help="Device to run on ('cpu' or 'cuda').")
+    parser.add_argument("--device", type=str, default="cpu", help="Device for PyTorch processing if any ('cpu' or 'cuda'). ONNX runs on CPU by default unless provider specified.")
     
     args = parser.parse_args()
-    device = torch.device(args.device)
+    # Device for PyTorch (audio loading/resampling)
+    pytorch_device = torch.device('cuda' if args.device == 'cuda' and torch.cuda.is_available() else 'cpu')
 
-    # 1. Load Mel Spectrogram parameters from BiCodec config
+
+    # 1. Load target_sample_rate from BiCodec config
     bicodec_config_path = Path(args.model_base_dir) / "BiCodec" / "config.yaml"
     if not bicodec_config_path.exists():
         print(f"ERROR: BiCodec config.yaml not found at {bicodec_config_path}")
         return
     
     full_config = load_config(bicodec_config_path)
+    # We only need mel_params for the target_sample_rate now
     if 'audio_tokenizer' not in full_config or 'mel_params' not in full_config['audio_tokenizer']:
         print(f"ERROR: 'mel_params' not found in {bicodec_config_path} under 'audio_tokenizer' key.")
         return
     mel_parameters = full_config['audio_tokenizer']['mel_params']
-    mel_parameters.setdefault('window_fn', 'hann_window')
-    mel_parameters.setdefault('center', True)
-    mel_parameters.setdefault('pad_mode', 'reflect')
-    mel_parameters.setdefault('power', 1.0) 
-    mel_parameters.setdefault('n_fft', mel_parameters.get('n_fft', 2048))
-    mel_parameters.setdefault('hop_length', mel_parameters.get('hop_length', mel_parameters['n_fft'] // 4))
-    mel_parameters.setdefault('win_length', mel_parameters.get('win_length', mel_parameters['n_fft']))
-    
     target_sample_rate = mel_parameters['sample_rate']
-    num_mel_channels_expected_by_config = mel_parameters['num_mels']
-    print(f"Using mel_params from config: {mel_parameters}")
-    print(f"Target sample rate for audio: {target_sample_rate}")
-    print(f"Expected num_mels (feature channels for speaker encoder) from config: {num_mel_channels_expected_by_config}")
+    # num_mel_channels_expected_by_config = mel_parameters['num_mels'] # Might not be needed if Mel ONNX output is trusted
+    print(f"Target sample rate for audio (from config): {target_sample_rate}")
 
-    # 2. Load and preprocess audio
+    # 2. Load and preprocess audio (using PyTorch)
     try:
         waveform, sample_rate = torchaudio.load(args.audio_file_path)
-        waveform = waveform.to(device)
+        waveform = waveform.to(pytorch_device)
     except Exception as e:
         print(f"Error loading audio file {args.audio_file_path}: {e}")
         return
 
     if sample_rate != target_sample_rate:
         print(f"Resampling audio from {sample_rate} Hz to {target_sample_rate} Hz...")
-        resampler = TT.Resample(orig_freq=sample_rate, new_freq=target_sample_rate).to(device)
+        resampler = TT.Resample(orig_freq=sample_rate, new_freq=target_sample_rate).to(pytorch_device)
         waveform = resampler(waveform)
     
     if waveform.ndim == 1: 
@@ -181,60 +180,88 @@ def main():
         print("Audio appears to be stereo, taking the first channel.")
         waveform = waveform[0, :].unsqueeze(0).unsqueeze(0)
     elif waveform.ndim == 2 and waveform.shape[0] == 1: 
-        waveform = waveform.unsqueeze(0) # Add batch: (1, Time) -> (1, 1, Time)
+        waveform = waveform.unsqueeze(0) 
     
     if waveform.shape[0] != 1 or waveform.shape[1] != 1:
          print(f"ERROR: Waveform processing resulted in unexpected shape: {waveform.shape}. Expected (1, 1, Time).")
          return
-    print(f"Loaded audio waveform shape (B, C, T): {waveform.shape}")
+    print(f"Loaded audio waveform shape for Mel ONNX (B, C, T): {waveform.shape}")
+    waveform_np = waveform.cpu().numpy() # ONNX runtime expects numpy
 
-    # 3. Calculate Mel Spectrogram
-    mel_calculator = MelSpectrogramCalculator(mel_parameters, device=device)
-    mel_calculator.eval()
+    # 3. Calculate Mel Spectrogram using the provided Mel ONNX model
+    mel_spectrogram_onnx_output = None
+    try:
+        print(f"Attempting to load Mel ONNX model: {args.mel_onnx_path}")
+        mel_ort_session_options = onnxruntime.SessionOptions()
+        mel_ort_providers = ['CPUExecutionProvider'] # Default to CPU for Mel
+        mel_ort_session = onnxruntime.InferenceSession(args.mel_onnx_path, sess_options=mel_ort_session_options, providers=mel_ort_providers)
+        
+        mel_onnx_input_name = mel_ort_session.get_inputs()[0].name
+        mel_onnx_output_name = mel_ort_session.get_outputs()[0].name
+        
+        print(f"Mel ONNX Input Name: '{mel_onnx_input_name}', Mel ONNX Output Name: '{mel_onnx_output_name}'")
+        # The input for mel_spectrogram.onnx from export_mel_spectrogram_onnx.py is "raw_waveform_with_channel"
+        # which matches our waveform_np shape (1, 1, T_audio)
+        mel_ort_inputs = {mel_onnx_input_name: waveform_np}
+        mel_spectrogram_onnx_output_list = mel_ort_session.run([mel_onnx_output_name], mel_ort_inputs)
+        mel_spectrogram_onnx_output = mel_spectrogram_onnx_output_list[0] # This is a numpy array
+
+        print(f"Mel Spectrogram from ONNX shape (B, n_mels, T_frames): {mel_spectrogram_onnx_output.shape}")
+
+    except Exception as e:
+        print(f"Error during Mel ONNX inference: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+
+    if mel_spectrogram_onnx_output is None:
+        print("Mel ONNX inference failed to produce output.")
+        return
+
+    # The speaker encoder ONNX model expects input shape (batch_size, mel_time_steps, mel_channels/features).
+    # The Mel ONNX output is likely (B, n_mels, T_frames).
+    # So, transpose (B, n_mels, T_frames) to (B, T_frames, n_mels).
+    # n_mels is feature_channels (dim 1 of ONNX output), T_frames is time_steps (dim 2 of ONNX output)
+    if mel_spectrogram_onnx_output.ndim == 3:
+        mel_input_for_speaker_encoder_onnx = np.ascontiguousarray(np.transpose(mel_spectrogram_onnx_output, (0, 2, 1)))
+    else:
+        print(f"Mel ONNX output has unexpected ndim: {mel_spectrogram_onnx_output.ndim}. Expected 3. Cannot transpose.")
+        return
+        
+    print(f"Mel spectrogram (from Mel ONNX) reshaped for Speaker Encoder ONNX (B, T_frames, n_mels): {mel_input_for_speaker_encoder_onnx.shape}")
     
-    with torch.no_grad():
-        # Input to MelCalculator: (B,1,T_audio), Output: (B, n_mels, num_frames)
-        mel_spectrogram = mel_calculator(waveform) 
-    print(f"Calculated Mel spectrogram shape (B, n_mels, T_frames): {mel_spectrogram.shape}")
+    # Save this for comparison with C#
+    np.save("python_mel_for_speaker_encoder.npy", mel_input_for_speaker_encoder_onnx)
+    print("Saved python_mel_for_speaker_encoder.npy")
 
-    # The speaker encoder ONNX model (exported by export_speaker_encoder_tokenizer_onnx.py)
-    # expects input shape (batch_size, mel_time_steps, mel_channels/features).
-    # - mel_time_steps corresponds to num_frames from the spectrogram.
-    # - mel_channels corresponds to n_mels from the spectrogram.
-    # So, transpose (B, n_mels, num_frames) to (B, num_frames, n_mels).
-    mel_input_for_onnx = mel_spectrogram.transpose(1, 2).contiguous()
-    print(f"Mel spectrogram reshaped for ONNX speaker encoder (B, T_frames, n_mels): {mel_input_for_onnx.shape}")
-
-    if mel_input_for_onnx.shape[2] != num_mel_channels_expected_by_config:
-        print(f"WARNING: Number of channels in Mel spectrogram ({mel_input_for_onnx.shape[2]}) "
-              f"does not match num_mels in config ({num_mel_channels_expected_by_config}). "
-              f"This could be an issue if the speaker encoder was trained/exported with a different feature size.")
 
     # 4. Run Speaker Encoder ONNX model
     try:
-        ort_session_options = onnxruntime.SessionOptions()
-        # ort_session_options.log_severity_level = 0 # Enable verbose logging for ONNX Runtime if needed
+        print(f"Attempting to load Speaker Encoder ONNX model: {args.speaker_encoder_onnx_path}")
+        spk_ort_session_options = onnxruntime.SessionOptions()
+        spk_ort_providers = ['CPUExecutionProvider']
+        if args.device == 'cuda' and onnxruntime.get_device() == 'GPU': # Check if onnxruntime-gpu is installed and CUDA is available
+             # Only add CUDAExecutionProvider if a GPU is actually available to ONNXRuntime
+            if 'CUDAExecutionProvider' in onnxruntime.get_available_providers():
+                spk_ort_providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+            else:
+                print("CUDAExecutionProvider not available in ONNXRuntime. Using CPU for Speaker Encoder.")
+
+
+        spk_ort_session = onnxruntime.InferenceSession(args.speaker_encoder_onnx_path, sess_options=spk_ort_session_options, providers=spk_ort_providers)
         
-        providers = ['CPUExecutionProvider']
-        if args.device == 'cuda' and onnxruntime.get_device() == 'GPU':
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        spk_onnx_input_name = spk_ort_session.get_inputs()[0].name
+        spk_onnx_output_name = spk_ort_session.get_outputs()[0].name
+        # spk_onnx_input_shape_expected = spk_ort_session.get_inputs()[0].shape 
+        # print(f"Speaker Encoder ONNX Input Name: '{spk_onnx_input_name}', Expected Shape (from model): {spk_onnx_input_shape_expected}")
+        print(f"Speaker Encoder ONNX Input Name: '{spk_onnx_input_name}', Output Name: '{spk_onnx_output_name}'")
         
-        print(f"Attempting to load ONNX model: {args.speaker_encoder_onnx_path} with providers: {providers}")
-        ort_session = onnxruntime.InferenceSession(args.speaker_encoder_onnx_path, sess_options=ort_session_options, providers=providers)
+        # mel_input_for_speaker_encoder_onnx is already a numpy array
+        spk_ort_inputs = {spk_onnx_input_name: mel_input_for_speaker_encoder_onnx}
+        spk_ort_outputs = spk_ort_session.run([spk_onnx_output_name], spk_ort_inputs)
         
-        onnx_input_name = ort_session.get_inputs()[0].name
-        onnx_input_shape_expected = ort_session.get_inputs()[0].shape # e.g. ['batch_size', 'mel_time_steps', 'mel_channels']
-        print(f"ONNX Speaker Encoder Input Name: '{onnx_input_name}', Expected Shape (from model): {onnx_input_shape_expected}")
-        
-        # Check if dynamic axes match the interpretation
-        # The third dimension of mel_input_for_onnx (n_mels) should match the 'mel_channels' expected by ONNX.
-        # The export script uses dummy_mel_channels for this, which should be num_mels.
-        
-        ort_inputs = {onnx_input_name: mel_input_for_onnx.cpu().numpy()}
-        ort_outputs = ort_session.run(None, ort_inputs)
-        
-        speaker_tokens_np = ort_outputs[0] 
-        print(f"ONNX Speaker Encoder successful. Output tokens name: '{ort_session.get_outputs()[0].name}', shape: {speaker_tokens_np.shape}")
+        speaker_tokens_np = spk_ort_outputs[0] 
+        print(f"ONNX Speaker Encoder successful. Output tokens name: '{spk_onnx_output_name}', shape: {speaker_tokens_np.shape}")
         print("Speaker Tokens (numeric IDs from Python ONNX):")
         print(speaker_tokens_np)
 
@@ -248,7 +275,6 @@ def main():
             print(flattened_tokens.tolist())
         else:
             print("Output token array is not of expected shape (1, Nq, NumTokens) or (1, NumTokensFlat). Manual inspection needed.")
-            print("If tokens are float, they might be intermediate embeddings rather than final IDs. Ensure the ONNX model is correct.")
 
     except Exception as e:
         print(f"Error during ONNX Speaker Encoder inference: {e}")
