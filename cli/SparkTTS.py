@@ -52,6 +52,7 @@ class SparkTTS:
         use_speaker_encoder_tokenizer_onnx: bool = False,
         use_llm_onnx: bool = False,
         use_mel_spectrogram_onnx: bool = False,
+        use_bicodec_encoder_quantizer_onnx: bool = False,
     ):
         """
         Initializes the SparkTTS model with the provided configurations and device.
@@ -67,6 +68,7 @@ class SparkTTS:
             use_speaker_encoder_tokenizer_onnx (bool, optional): Whether to use ONNX for Speaker Encoder tokenizer.
             use_llm_onnx (bool, optional): Whether to use ONNX for LLM inference.
             use_mel_spectrogram_onnx (bool, optional): Whether to use ONNX for Mel Spectrogram generation.
+            use_bicodec_encoder_quantizer_onnx (bool, optional): Whether to use ONNX for BiCodec encoder+quantizer.
         """
         self.device = device
         self.model_dir = model_dir
@@ -80,9 +82,11 @@ class SparkTTS:
         self.use_speaker_encoder_tokenizer_onnx = use_speaker_encoder_tokenizer_onnx
         self.use_llm_onnx = use_llm_onnx
         self.use_mel_spectrogram_onnx = use_mel_spectrogram_onnx
+        self.use_bicodec_encoder_quantizer_onnx = use_bicodec_encoder_quantizer_onnx
         self.onnx_bicodec_vocoder_session = None
         self.onnx_speaker_encoder_tokenizer_session = None
         self.onnx_llm_model = None
+        self.onnx_encoder_quantizer_session = None
         self._initialize_inference()
 
     def _initialize_inference(self):
@@ -147,14 +151,16 @@ class SparkTTS:
                     print("✗ torch.compile not available for PyTorch model - requires PyTorch 2.0+")
             print("✓ PyTorch LLM initialized.")
         
-        print(f"Initializing BiCodecTokenizer with use_onnx_wav2vec2={self.use_wav2vec2_onnx}, use_speaker_encoder_tokenizer_onnx={self.use_speaker_encoder_tokenizer_onnx}, use_mel_spectrogram_onnx={self.use_mel_spectrogram_onnx}")
+        print(f"Initializing BiCodecTokenizer with use_onnx_wav2vec2={self.use_wav2vec2_onnx}, use_speaker_encoder_tokenizer_onnx={self.use_speaker_encoder_tokenizer_onnx}, use_mel_spectrogram_onnx={self.use_mel_spectrogram_onnx}, use_bicodec_encoder_quantizer_onnx={self.use_bicodec_encoder_quantizer_onnx}")
         self.audio_tokenizer = BiCodecTokenizer(
             self.model_dir, 
             device=self.device,
             use_onnx_wav2vec2=self.use_wav2vec2_onnx,
             use_speaker_encoder_tokenizer_onnx=self.use_speaker_encoder_tokenizer_onnx,
             onnx_speaker_encoder_tokenizer_session=self.onnx_speaker_encoder_tokenizer_session,
-            use_mel_spectrogram_onnx=self.use_mel_spectrogram_onnx
+            use_mel_spectrogram_onnx=self.use_mel_spectrogram_onnx,
+            use_bicodec_encoder_quantizer_onnx=self.use_bicodec_encoder_quantizer_onnx,
+            onnx_encoder_quantizer_session=self.onnx_encoder_quantizer_session
         )
         print("==== Model Initialization Complete ====\n")
 
@@ -194,7 +200,9 @@ class SparkTTS:
                         use_onnx_wav2vec2=self.use_wav2vec2_onnx,
                         use_speaker_encoder_tokenizer_onnx=self.use_speaker_encoder_tokenizer_onnx,
                         onnx_speaker_encoder_tokenizer_session=self.onnx_speaker_encoder_tokenizer_session,
-                        use_mel_spectrogram_onnx=self.use_mel_spectrogram_onnx
+                        use_mel_spectrogram_onnx=self.use_mel_spectrogram_onnx,
+                        use_bicodec_encoder_quantizer_onnx=self.use_bicodec_encoder_quantizer_onnx,
+                        onnx_encoder_quantizer_session=self.onnx_encoder_quantizer_session
                     )
                 except Exception as e:
                     print(f"✗ Failed to load ONNX Speaker Encoder Tokenizer: {e}")
@@ -204,6 +212,36 @@ class SparkTTS:
                 print(f"✗ ONNX Speaker Encoder Tokenizer model not found at {onnx_se_tokenizer_path}")
                 print("  Falling back to PyTorch Speaker Encoder Tokenizer.")
                 self.onnx_speaker_encoder_tokenizer_session = None
+
+        if self.use_bicodec_encoder_quantizer_onnx:
+            onnx_eq_path = Path("./onnx_models/bicodec_encoder_quantizer.onnx")
+            print(f"Attempting to load ONNX BiCodec Encoder/Quantizer from: {onnx_eq_path}")
+            if onnx_eq_path.exists():
+                try:
+                    self.onnx_encoder_quantizer_session = onnxruntime.InferenceSession(
+                        str(onnx_eq_path),
+                        providers=['CPUExecutionProvider']
+                    )
+                    print(f"✓ Successfully loaded ONNX BiCodec Encoder/Quantizer from {onnx_eq_path}")
+                    print(f"Re-initializing BiCodecTokenizer to pass loaded ONNX Encoder/Quantizer session.")
+                    self.audio_tokenizer = BiCodecTokenizer(
+                        self.model_dir,
+                        device=self.device,
+                        use_onnx_wav2vec2=self.use_wav2vec2_onnx,
+                        use_speaker_encoder_tokenizer_onnx=self.use_speaker_encoder_tokenizer_onnx,
+                        onnx_speaker_encoder_tokenizer_session=self.onnx_speaker_encoder_tokenizer_session,
+                        use_mel_spectrogram_onnx=self.use_mel_spectrogram_onnx,
+                        use_bicodec_encoder_quantizer_onnx=self.use_bicodec_encoder_quantizer_onnx,
+                        onnx_encoder_quantizer_session=self.onnx_encoder_quantizer_session
+                    )
+                except Exception as e:
+                    print(f"✗ Failed to load ONNX BiCodec Encoder/Quantizer: {e}")
+                    print("  Falling back to PyTorch Encoder/Quantizer.")
+                    self.onnx_encoder_quantizer_session = None
+            else:
+                print(f"✗ ONNX BiCodec Encoder/Quantizer model not found at {onnx_eq_path}")
+                print("  Falling back to PyTorch Encoder/Quantizer.")
+                self.onnx_encoder_quantizer_session = None
 
     def _measure_time(self, func, *args, **kwargs):
         """Helper method to measure execution time of a function."""

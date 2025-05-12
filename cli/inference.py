@@ -163,6 +163,11 @@ def parse_args():
         action="store_true",
         help="Use ONNX for Mel Spectrogram generation."
     )
+    parser.add_argument(
+        "--use_bicodec_encoder_quantizer_onnx",
+        action="store_true",
+        help="Use ONNX for BiCodec encoder/quantizer."
+    )
     return parser.parse_args()
 
 
@@ -201,6 +206,7 @@ def run_tts(args):
         use_speaker_encoder_tokenizer_onnx=args.use_speaker_encoder_tokenizer_onnx,
         use_llm_onnx=args.use_llm_onnx,
         use_mel_spectrogram_onnx=args.use_mel_spectrogram_onnx,
+        use_bicodec_encoder_quantizer_onnx=args.use_bicodec_encoder_quantizer_onnx,
     )
 
     # Run benchmark if requested

@@ -16,9 +16,12 @@
 import torch
 import torch.nn as nn
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional, Tuple
 from omegaconf import DictConfig
 from safetensors.torch import load_file
+import torchaudio
+import onnxruntime
+import numpy as np
 
 from sparktts.utils.file import load_config
 from sparktts.modules.speaker.speaker_encoder import SpeakerEncoder
@@ -26,6 +29,7 @@ from sparktts.modules.encoder_decoder.feat_encoder import Encoder
 from sparktts.modules.encoder_decoder.feat_decoder import Decoder
 from sparktts.modules.encoder_decoder.wave_generator import WaveGenerator
 from sparktts.modules.vq.factorized_vector_quantize import FactorizedVectorQuantize
+from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2Model, AutoConfig
 
 
 class BiCodec(nn.Module):
@@ -385,3 +389,308 @@ if __name__ == "__main__":
         print("Test successful")
     else:
         print("Test failed")
+
+
+class BiCodecTokenizer:
+    """
+    Loads and utilizes Wav2Vec2, Speaker Encoder, and Mel Spectrogram components
+    (either PyTorch or ONNX versions) to tokenize audio into global and semantic tokens.
+    """
+
+    def __init__(
+        self,
+        model_dir: Path,
+        device: torch.device,
+        use_onnx_wav2vec2: bool = False,
+        use_speaker_encoder_tokenizer_onnx: bool = False,
+        onnx_speaker_encoder_tokenizer_session: Optional[onnxruntime.InferenceSession] = None,
+        use_mel_spectrogram_onnx: bool = False,
+        use_bicodec_encoder_quantizer_onnx: bool = False, # Added flag
+        onnx_encoder_quantizer_session: Optional[onnxruntime.InferenceSession] = None, # Added session
+    ):
+        self.device = device
+        self.model_dir = model_dir
+        self.use_onnx_wav2vec2 = use_onnx_wav2vec2
+        self.use_speaker_encoder_tokenizer_onnx = use_speaker_encoder_tokenizer_onnx
+        self.onnx_speaker_encoder_tokenizer_session = onnx_speaker_encoder_tokenizer_session
+        self.use_mel_spectrogram_onnx = use_mel_spectrogram_onnx
+        self.use_bicodec_encoder_quantizer_onnx = use_bicodec_encoder_quantizer_onnx # Store flag
+        self.onnx_encoder_quantizer_session = onnx_encoder_quantizer_session # Store session
+
+        self.bicodec_config = load_config(f"{model_dir}/BiCodec/config.yaml")
+        self.sample_rate = self.bicodec_config.get("sample_rate", 16000)
+
+        # ---- Initialize Components ----
+        print("Initializing BiCodecTokenizer Components...")
+
+        # 1. Mel Spectrogram (PyTorch or ONNX - Although ONNX Mel is typically loaded externally)
+        if not self.use_mel_spectrogram_onnx:
+            print("Loading PyTorch MelSpectrogram...")
+            try:
+                mel_params = self.bicodec_config.get('audio_tokenizer', {}).get('mel_params', {})
+                # Add defaults if missing in config, necessary for MelSpectrogram init
+                mel_params.setdefault('sample_rate', self.sample_rate)
+                mel_params.setdefault('n_fft', 1024)
+                mel_params.setdefault('win_length', mel_params['n_fft'])
+                mel_params.setdefault('hop_length', mel_params['n_fft'] // 4)
+                mel_params.setdefault('num_mels', 128)
+                self.mel_spectrogram_generator = MelSpectrogram(**mel_params)
+                self.mel_spectrogram_generator.eval()
+                self.mel_spectrogram_generator.to(self.device)
+                print("✓ PyTorch MelSpectrogram loaded.")
+            except Exception as e:
+                print(f"✗ Failed to load PyTorch MelSpectrogram: {e}")
+                self.mel_spectrogram_generator = None
+        else:
+            print("Skipping PyTorch MelSpectrogram loading (ONNX version expected externally).")
+            self.mel_spectrogram_generator = None # ONNX version handled by caller usually
+
+        # 2. Speaker Encoder Tokenizer (PyTorch or ONNX)
+        if not self.use_speaker_encoder_tokenizer_onnx:
+            print("Loading PyTorch Speaker Encoder...")
+            try:
+                # Load the speaker encoder part from the full BiCodec model
+                temp_bicodec_spk = BiCodec.load_from_checkpoint(f"{model_dir}/BiCodec", device=self.device)
+                self.speaker_encoder = temp_bicodec_spk.speaker_encoder
+                self.speaker_encoder.eval()
+                print("✓ PyTorch Speaker Encoder loaded.")
+                del temp_bicodec_spk
+            except Exception as e:
+                print(f"✗ Failed to load PyTorch Speaker Encoder: {e}")
+                self.speaker_encoder = None
+        elif self.onnx_speaker_encoder_tokenizer_session:
+            print("✓ Using provided ONNX Speaker Encoder Tokenizer session.")
+            self.speaker_encoder = None # Not needed if using ONNX
+        else:
+            print("ONNX Speaker Encoder Tokenizer requested but no session provided/loaded.")
+            self.speaker_encoder = None
+
+        # 3. Wav2Vec2 (PyTorch or ONNX)
+        self.feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(f"{model_dir}/wav2vec2-large-xlsr-53")
+        if self.use_onnx_wav2vec2:
+            onnx_w2v2_path = Path("./onnx_models") / "wav2vec2_model.onnx"
+            print(f"Attempting to load ONNX Wav2Vec2 model from: {onnx_w2v2_path}")
+            if onnx_w2v2_path.exists():
+                try:
+                    self.onnx_wav2vec2_session = onnxruntime.InferenceSession(
+                        str(onnx_w2v2_path), providers=['CPUExecutionProvider']
+                    )
+                    self.wav2vec2 = None # Don't need PyTorch version
+                    print(f"✓ Successfully loaded ONNX Wav2Vec2 from {onnx_w2v2_path}")
+                except Exception as e:
+                    print(f"✗ Failed to load ONNX Wav2Vec2: {e}. Will attempt PyTorch fallback.")
+                    self.onnx_wav2vec2_session = None
+                    self.wav2vec2 = None # Reset before attempting PyTorch
+            else:
+                print(f"✗ ONNX Wav2Vec2 model not found at {onnx_w2v2_path}. Will attempt PyTorch fallback.")
+                self.onnx_wav2vec2_session = None
+                self.wav2vec2 = None # Reset before attempting PyTorch
+        
+        # Fallback or default to PyTorch Wav2Vec2 if ONNX failed or wasn't requested
+        if not self.onnx_wav2vec2_session:
+            print("Loading PyTorch Wav2Vec2 model...")
+            try:
+                config = AutoConfig.from_pretrained(f"{model_dir}/wav2vec2-large-xlsr-53")
+                config.output_hidden_states = True # Ensure hidden states are output
+                self.wav2vec2 = Wav2Vec2Model.from_pretrained(
+                    f"{model_dir}/wav2vec2-large-xlsr-53", config=config
+                )
+                self.wav2vec2.eval()
+                self.wav2vec2.to(self.device)
+                print("✓ PyTorch Wav2Vec2 model loaded.")
+            except Exception as e:
+                print(f"✗ Failed to load PyTorch Wav2Vec2: {e}")
+                self.wav2vec2 = None
+
+        # 4. BiCodec Encoder/Quantizer (PyTorch or ONNX)
+        if not self.use_bicodec_encoder_quantizer_onnx:
+            print("Loading PyTorch BiCodec Encoder and Quantizer...")
+            try:
+                temp_bicodec_eq = BiCodec.load_from_checkpoint(f"{model_dir}/BiCodec", device=self.device)
+                self.encoder = temp_bicodec_eq.encoder
+                self.quantizer = temp_bicodec_eq.quantizer
+                self.encoder.eval()
+                self.quantizer.eval()
+                print("✓ PyTorch BiCodec Encoder and Quantizer loaded.")
+                del temp_bicodec_eq # Free memory
+            except Exception as e:
+                print(f"✗ Failed to load PyTorch BiCodec Encoder/Quantizer: {e}")
+                self.encoder = None
+                self.quantizer = None
+        elif self.onnx_encoder_quantizer_session:
+            print("✓ Using provided ONNX BiCodec Encoder/Quantizer session.")
+            self.encoder = None
+            self.quantizer = None
+        else:
+            # This case is handled during SparkTTS init where session loading is attempted
+            print("ONNX Encoder/Quantizer requested but no session provided/loaded.")
+            self.encoder = None
+            self.quantizer = None
+
+        print("✓ BiCodecTokenizer Initialized.")
+
+    def _load_audio(self, audio_path: str) -> torch.Tensor:
+        """Loads and preprocesses audio from a file path."""
+        wav, sr = load_audio(audio_path)
+        if wav is None:
+            return None
+        if sr != self.sample_rate:
+            print(f"Warning: Resampling audio from {sr} Hz to {self.sample_rate} Hz")
+            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=self.sample_rate)
+            wav = resampler(wav)
+        wav = audio_volume_normalize(wav)
+        # Ensure mono
+        if wav.ndim > 1 and wav.shape[0] > 1:
+            wav = torch.mean(wav, dim=0, keepdim=True)
+        # Ensure batch dimension
+        if wav.ndim == 1:
+            wav = wav.unsqueeze(0)
+        return wav.to(self.device)
+
+    def tokenize(self, audio_path: str) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Tokenizes the given audio file into global speaker tokens and semantic tokens.
+
+        Args:
+            audio_path (str): Path to the input audio file (.wav).
+
+        Returns:
+            Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]: 
+                (global_tokens, semantic_tokens). Tensors are on the initialized device.
+                Returns (None, None) if any critical step fails.
+        """
+        print(f"\n--- Tokenizing Audio: {audio_path} ---")
+        wav = self._load_audio(audio_path)
+        if wav is None:
+            print("Error: Failed to load audio.")
+            return None, None
+
+        # 1. Calculate Mel Spectrogram (using PyTorch version for now)
+        # TODO: Add path for using ONNX Mel Spectrogram if needed, requires input from caller
+        if self.mel_spectrogram_generator:
+            print("Calculating Mel Spectrogram using PyTorch...")
+            try:
+                with torch.no_grad():
+                    mel = self.mel_spectrogram_generator(wav)
+                    print(f"PyTorch Mel shape: {mel.shape}") # Expect (B, n_mels, T_mel)
+            except Exception as e:
+                print(f"✗ Error during PyTorch Mel Spectrogram generation: {e}")
+                return None, None
+        else:
+            print("Error: Mel Spectrogram generator not available.")
+            return None, None
+
+        # 2. Calculate Global Speaker Tokens (PyTorch or ONNX)
+        global_tokens = None
+        if self.use_speaker_encoder_tokenizer_onnx and self.onnx_speaker_encoder_tokenizer_session:
+            print("Calculating global tokens using ONNX Speaker Encoder Tokenizer...")
+            try:
+                # Speaker Encoder ONNX expects (B, T_mel, n_mels)
+                mel_onnx_input = mel.permute(0, 2, 1).contiguous().cpu().numpy()
+                onnx_inputs = {self.onnx_speaker_encoder_tokenizer_session.get_inputs()[0].name: mel_onnx_input}
+                global_tokens_np = self.onnx_speaker_encoder_tokenizer_session.run(None, onnx_inputs)[0]
+                global_tokens = torch.from_numpy(global_tokens_np).to(self.device)
+                print(f"ONNX Global Tokens shape: {global_tokens.shape}")
+            except Exception as e:
+                print(f"✗ Error during ONNX Speaker Encoder Tokenizer inference: {e}")
+                return None, None # Global tokens are essential
+        elif self.speaker_encoder:
+            print("Calculating global tokens using PyTorch Speaker Encoder...")
+            try:
+                with torch.no_grad():
+                    # PyTorch SpeakerEncoder.tokenize expects (B, T_mel, n_mels)
+                    global_tokens = self.speaker_encoder.tokenize(mel.permute(0, 2, 1).contiguous())
+                    print(f"PyTorch Global Tokens shape: {global_tokens.shape}")
+            except Exception as e:
+                print(f"✗ Error during PyTorch Speaker Encoder inference: {e}")
+                return None, None
+        else:
+            print("Error: Speaker Encoder (PyTorch or ONNX) not available.")
+            return None, None
+
+        # 3. Prepare audio for Wav2Vec2 (feature extraction)
+        print("Preparing audio for Wav2Vec2...")
+        try:
+            # Wav2Vec2 expects raw waveform
+            wav_input_for_w2v2 = wav.squeeze(0).cpu().numpy() # Needs single waveform for feature_extractor
+            processed_inputs = self.feature_extractor(wav_input_for_w2v2, return_tensors="pt", sampling_rate=self.sample_rate, padding=True)
+            input_values = processed_inputs.input_values.to(self.device)
+            print(f"Wav2Vec2 input shape: {input_values.shape}")
+        except Exception as e:
+            print(f"✗ Error during Wav2Vec2 feature extraction preparation: {e}")
+            return global_tokens, None # Return global tokens, but semantic failed
+
+        # 4. Extract features using Wav2Vec2 (PyTorch or ONNX)
+        feat = None
+        if self.use_onnx_wav2vec2 and self.onnx_wav2vec2_session:
+            print("Extracting features using ONNX Wav2Vec2...")
+            try:
+                onnx_inputs = {self.onnx_wav2vec2_session.get_inputs()[0].name: input_values.cpu().numpy()}
+                # Assuming the desired features are the last hidden state
+                onnx_outputs = self.onnx_wav2vec2_session.run(None, onnx_inputs)
+                feat_np = onnx_outputs[-1] # Take the last hidden state
+                feat = torch.from_numpy(feat_np).to(self.device)
+                print(f"ONNX Wav2Vec2 Feature shape: {feat.shape}")
+            except Exception as e:
+                print(f"✗ Error during ONNX Wav2Vec2 inference: {e}")
+                return global_tokens, None
+        elif self.wav2vec2:
+            print("Extracting features using PyTorch Wav2Vec2...")
+            try:
+                with torch.no_grad():
+                    # Wav2Vec2 output is a BaseModelOutput, hidden_states is a tuple
+                    outputs = self.wav2vec2(input_values)
+                    feat = outputs.hidden_states[-1] # Take the last hidden state
+                    print(f"PyTorch Wav2Vec2 Feature shape: {feat.shape}")
+            except Exception as e:
+                print(f"✗ Error during PyTorch Wav2Vec2 inference: {e}")
+                return global_tokens, None
+            except AttributeError:
+                # Fallback if hidden_states isn't available (e.g. config issue)
+                 with torch.no_grad():
+                    outputs = self.wav2vec2(input_values)
+                    feat = outputs.last_hidden_state # Use last_hidden_state as fallback
+                    print(f"PyTorch Wav2Vec2 Feature shape (using last_hidden_state): {feat.shape}")
+
+        else:
+            print("Error: Wav2Vec2 model (PyTorch or ONNX) is not available.")
+            return global_tokens, None # Return global tokens but indicate semantic failure
+
+        if feat is None:
+            print("Error: Failed to extract Wav2Vec2 features.")
+            return global_tokens, None
+        
+        # 5. Calculate semantic tokens (PyTorch or ONNX)
+        semantic_tokens = None
+        if self.use_bicodec_encoder_quantizer_onnx and self.onnx_encoder_quantizer_session:
+            print("Calculating semantic tokens using ONNX BiCodec Encoder/Quantizer...")
+            try:
+                # ONNX model expects (B, T_feat, D_feat)
+                onnx_inputs = {self.onnx_encoder_quantizer_session.get_inputs()[0].name: feat.cpu().numpy()}
+                semantic_tokens_np = self.onnx_encoder_quantizer_session.run(None, onnx_inputs)[0]
+                semantic_tokens = torch.from_numpy(semantic_tokens_np).to(self.device) # Assuming output is int64
+                print(f"ONNX Semantic Tokens shape: {semantic_tokens.shape}")
+            except Exception as e:
+                print(f"✗ Error during ONNX Encoder/Quantizer inference: {e}")
+                return global_tokens, None # Return global tokens but indicate semantic failure
+        elif self.encoder and self.quantizer: # Use PyTorch path
+            print("Calculating semantic tokens using PyTorch BiCodec Encoder/Quantizer...")
+            try:
+                with torch.no_grad():
+                    # PyTorch encoder expects (B, D_feat, T_feat)
+                    z = self.encoder(feat.transpose(1, 2))
+                    semantic_tokens = self.quantizer.tokenize(z)
+                    print(f"PyTorch Semantic Tokens shape: {semantic_tokens.shape}")
+            except Exception as e:
+                print(f"✗ Error during PyTorch Encoder/Quantizer inference: {e}")
+                return global_tokens, None
+        else:
+            print("Error: Neither ONNX nor PyTorch BiCodec Encoder/Quantizer is available.")
+            return global_tokens, None # Return global tokens but indicate semantic failure
+
+        # 6. Detach tensors if needed and return
+        global_tokens = global_tokens.detach() if global_tokens is not None else None
+        semantic_tokens = semantic_tokens.detach() if semantic_tokens is not None else None
+
+        print("--- Tokenization Complete ---")
+        return global_tokens, semantic_tokens
