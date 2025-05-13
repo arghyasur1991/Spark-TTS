@@ -31,7 +31,7 @@ root_dir=$(dirname "$script_dir")
 device=0
 save_dir='example/results'
 model_dir="pretrained_models/Spark-TTS-0.5B"
-text="Hello World"
+text="Hello world, How are you? I am also good. So I am the narrator"
 # text="Did you not *just* state it? 'Arghya', was it? Yes, I heard you. I acknowledged it."
 prompt_speech_path="/Users/sur/Personal/Projects/ML/MysteryAI/Assets/Resources/audio/narrator_voice_prompt.wav"
 # prompt_speech_path="example/results/prompt.wav"
@@ -171,13 +171,13 @@ echo -e "${GREEN}Starting style control inference...${NC}"
 
 # Run style control inference
 python -m cli.inference \
-    --text "This is a test using style controls: male voice, high pitch, low speed." \
+    --text "${text}" \
     --device "${device}" \
     --save_dir "${save_dir}/style_control" \
     --model_dir "${model_dir}" \
     --gender "female" \
     --pitch "high" \
-    --speed "low" \
+    --speed "moderate" \
     --quantization "${quantization}" \
     --max_new_tokens "${max_new_tokens}" \
     --temperature "${temperature}" \

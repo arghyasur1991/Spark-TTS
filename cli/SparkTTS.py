@@ -530,8 +530,9 @@ class SparkTTS:
         )
 
         if is_control_mode and global_token_ids is None:
+            extracted_global_tokens_from_predicts = [int(token) for token in re.findall(r"bicodec_global_(\d+)", predicts)]
             global_token_ids = (
-                torch.tensor([int(token) for token in re.findall(r"bicodec_global_(\d+)", predicts)])
+                torch.tensor(extracted_global_tokens_from_predicts) # Use the temp list
                 .long()
                 .unsqueeze(0)
                 .unsqueeze(0)
