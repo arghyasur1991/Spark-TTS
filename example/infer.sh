@@ -142,5 +142,51 @@ python -m cli.inference \
     ${onnx_arg}
 
 echo -e "${GREEN}Inference complete! Results saved to ${save_dir}${NC}"
+
+
+# --- Style Control Example ---
+echo
+echo -e "${BLUE}SparkTTS Style Control Inference Example${NC}"
+echo -e "${YELLOW}Configuration:${NC}"
+echo "• Model: $model_dir"
+echo "• Device: $device"
+echo "• Quantization: $quantization"
+echo "• Text: Style Control Example Text"
+echo "• Style Parameters:"
+echo "  - Gender: male"
+echo "  - Pitch: high"
+echo "  - Speed: low"
+echo "• Generation Parameters:"
+echo "  - Max Tokens: $max_new_tokens"
+echo "  - Temperature: $temperature"
+echo "  - Top-k: $top_k"
+echo "  - Top-p: $top_p"
+echo "  - Sampling: $do_sample"
+echo "  - Use Compile: $use_compile"
+echo "  - Compile Mode: $compile_mode"
+echo "  - Use LLM ONNX: $use_llm_onnx" # Note: Prompt-related ONNX flags are not relevant here
+echo
+
+echo -e "${GREEN}Starting style control inference...${NC}"
+
+# Run style control inference
+python -m cli.inference \
+    --text "This is a test using style controls: male voice, high pitch, low speed." \
+    --device "${device}" \
+    --save_dir "${save_dir}/style_control" \
+    --model_dir "${model_dir}" \
+    --gender "female" \
+    --pitch "high" \
+    --speed "low" \
+    --quantization "${quantization}" \
+    --max_new_tokens "${max_new_tokens}" \
+    --temperature "${temperature}" \
+    --top_k "${top_k}" \
+    --top_p "${top_p}" \
+    --compile_mode "${compile_mode}" \
+    ${additional_args} \
+    ${onnx_arg} # Include relevant ONNX flags if used (e.g., LLM, BiCodec)
+
+echo -e "${GREEN}Style control inference complete! Results saved to ${save_dir}/style_control${NC}"
     
     
