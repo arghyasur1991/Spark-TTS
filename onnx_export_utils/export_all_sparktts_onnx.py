@@ -5,6 +5,12 @@ import shutil
 import sys
 from pathlib import Path
 
+# Add the project root to sys.path to allow imports from sparktts, etc.
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent # This assumes scripts are in onnx_export_utils, and project root is its parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
+
 def run_export_script(script_name: str, script_args: list[str], verbose: bool = False):
     """Runs a given export script with the provided arguments."""
     command = [sys.executable, script_name] + script_args
@@ -38,14 +44,14 @@ def main():
     parser.add_argument(
         "--base_model_dir",
         type=Path,
-        default=Path("./pretrained_models/Spark-TTS-0.5B"),
-        help="Path to the base SparkTTS model directory (e.g., ./pretrained_models/Spark-TTS-0.5B)."
+        default=Path("../pretrained_models/Spark-TTS-0.5B"),
+        help="Path to the base SparkTTS model directory (e.g., ../pretrained_models/Spark-TTS-0.5B)."
     )
     parser.add_argument(
         "--output_base_dir",
         type=Path,
-        default=Path("./onnx_models_exported"), 
-        help="Base directory for the final ONNX model structure (e.g., ./onnx_models_exported)."
+        default=Path("../onnx_models_exported"), 
+        help="Base directory for the final ONNX model structure (e.g., ../onnx_models_exported)."
     )
     parser.add_argument(
         "--opset_version",
@@ -68,7 +74,7 @@ def main():
     parser.add_argument(
         "--sample_audio_for_vocoder",
         type=str, # Kept as string, sub-script handles Path conversion
-        default="./example/prompt_audio.wav",
+        default="../example/prompt_audio.wav",
         help="Path to a sample WAV file to derive token shapes for BiCodec Vocoder dummy inputs."
     )
     parser.add_argument(

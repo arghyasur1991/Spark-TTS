@@ -4,6 +4,12 @@ import sys
 from pathlib import Path
 from typing import Tuple
 
+# Add the project root to sys.path to allow imports from sparktts, etc.
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent # This assumes scripts are in onnx_export_utils, and project root is its parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
+
 import numpy as np
 import onnx
 import onnxruntime
