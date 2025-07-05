@@ -5,6 +5,23 @@ import shutil
 import sys
 from pathlib import Path
 
+# =======================================================================================
+# DEPRECATION NOTICE
+# =======================================================================================
+print("⚠️  DEPRECATION NOTICE: This script is deprecated!")
+print("📝 Please use the new consolidated export script instead:")
+print("   python export_sparktts_onnx.py --help")
+print()
+print("🚀 The new script provides:")
+print("   • Multiple precision support (FP32, FP16, INT8)")
+print("   • Better optimization and verification")
+print("   • Cleaner output organization")
+print("   • Unified interface similar to LivePortrait/MuseTalk")
+print()
+print("💡 For migration help, see: README_ONNX_Export.md")
+print("=" * 80)
+print()
+
 def run_export_script(script_name: str, script_args: list[str], verbose: bool = False):
     """Runs a given export script with the provided arguments."""
     command = [sys.executable, script_name] + script_args

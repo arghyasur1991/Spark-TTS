@@ -29,6 +29,7 @@ share/python-wheels/
 MANIFEST
 webui_test.py
 onnx_models_exported/
+onnx_models/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
