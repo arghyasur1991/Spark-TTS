@@ -228,31 +228,155 @@ class BiCodecEncoderQuantizerWrapper(nn.Module):
         return semantic_tokens
 
 class SpeakerEncoderTokenizerWrapper(nn.Module):
-    """Wrapper for speaker encoder and tokenizer."""
-    
-    def __init__(self, speaker_encoder, speaker_tokenizer):
+    """
+    Wrapper for the SpeakerEncoder's tokenize method for ONNX export.
+    This module takes Mel spectrograms and outputs global speaker token IDs.
+    """
+    def __init__(self, speaker_encoder_model):
         super().__init__()
-        self.speaker_encoder = speaker_encoder
-        self.speaker_tokenizer = speaker_tokenizer
-        
-    def forward(self, audio_features: torch.Tensor) -> torch.Tensor:
-        # Encode speaker features
-        speaker_embedding = self.speaker_encoder(audio_features)
-        # Tokenize speaker embedding
-        speaker_tokens = self.speaker_tokenizer(speaker_embedding)
-        return speaker_tokens
+        self.speaker_encoder = speaker_encoder_model
+
+    def forward(self, mels: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            mels (torch.Tensor): Input Mel spectrogram tensor.
+                                 Expected shape: (B, T_mel, D_mel_features),
+                                 e.g., (1, 200, 128) for ECAPA-TDNN.
+
+        Returns:
+            torch.Tensor: Global speaker token IDs.
+                          Shape depends on the speaker encoder's quantizer configuration,
+                          e.g., (B, N_quant_levels, T_quant_tokens) or (B, T_quant_tokens_flat).
+        """
+        # The SpeakerEncoder.tokenize method should internally handle the onnx_export_mode
+        # to ensure its quantizer (FSQ) uses export-friendly operations.
+        return self.speaker_encoder.tokenize(mels, onnx_export_mode=True)
 
 class BiCodecVocoderWrapper(nn.Module):
-    """Wrapper for BiCodec vocoder."""
-    
-    def __init__(self, vocoder_model):
+    """
+    Wrapper for BiCodec's vocoding components (detokenizer, prenet, generator) for ONNX export.
+    Takes semantic tokens and global speaker tokens, and outputs a waveform.
+    """
+    def __init__(self, bicodec_model):
         super().__init__()
-        self.vocoder = vocoder_model
+        self.quantizer = bicodec_model.quantizer
+        self.speaker_encoder = bicodec_model.speaker_encoder
+        self.prenet = bicodec_model.prenet
+        self.decoder = bicodec_model.decoder  # This is the WaveGenerator (vocoder)
+
+    def forward(self, semantic_tokens: torch.Tensor, global_tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Performs vocoding from semantic and global speaker tokens to a waveform.
+
+        Args:
+            semantic_tokens (torch.Tensor): Semantic token IDs.
+                Expected shape: (B, N_quant_semantic, T_semantic) or (B, T_semantic_flat).
+            global_tokens (torch.Tensor): Global speaker token IDs.
+                Expected shape: (B, N_quant_global, T_global).
+
+        Returns:
+            torch.Tensor: Reconstructed audio waveform.
+                          Shape: (B, 1, T_audio) or (B, T_audio).
+        """
+        # 1. Detokenize semantic tokens to get quantized embeddings `z_q`
+        z_q = self.quantizer.detokenize(semantic_tokens)
+
+        # 2. Detokenize global speaker tokens to get speaker embedding `d_vector`
+        d_vector = self.speaker_encoder.detokenize(global_tokens, onnx_export_mode=True)
         
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        # Convert tokens to audio waveform
-        audio_waveform = self.vocoder.decode(tokens)
-        return audio_waveform
+        # 3. Pass `z_q` and `d_vector` through the prenet
+        x_prenet = self.prenet(z_q, d_vector)
+        
+        # 4. Condition prenet output with speaker embedding before the decoder
+        # `d_vector` [B, D_spk] needs to be broadcastable with `x_prenet` [B, D_prenet, T_prenet].
+        if d_vector.ndim == 2 and x_prenet.ndim == 3:
+            if d_vector.shape[0] == x_prenet.shape[0] and d_vector.shape[1] == x_prenet.shape[1]:
+                condition_vector = d_vector.unsqueeze(-1)  # Makes d_vector [B, D_spk, 1]
+            else:
+                raise ValueError(
+                    f"Shape mismatch for conditioning: d_vector {d_vector.shape}, x_prenet {x_prenet.shape}. "
+                    f"Channel dimensions (dim 1) must match."
+                )
+        elif d_vector.ndim == x_prenet.ndim and d_vector.shape == x_prenet.shape:
+            condition_vector = d_vector
+        else:
+            raise ValueError(
+                f"Unexpected dimensions for conditioning: d_vector {d_vector.ndim}D {d_vector.shape}, "
+                f"x_prenet {x_prenet.ndim}D {x_prenet.shape}. Cannot broadcast."
+            )
+
+        x_conditioned = x_prenet + condition_vector
+        
+        # 5. Generate waveform using the decoder (WaveGenerator)
+        wav_recon = self.decoder(x_conditioned)
+        return wav_recon
+
+def get_dummy_tokens_from_sample_audio(
+    model_base_dir: Path, 
+    device: torch.device, 
+    sample_audio_path_str: str,
+    target_sample_rate: int = 16000,  # Default SR for dummy audio if created
+    duration_sec: int = 1  # Duration for dummy audio if created
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Generates dummy semantic and global tokens by tokenizing a sample audio file.
+    This ensures the dummy tokens have realistic shapes for ONNX export.
+    If the sample audio path doesn't exist, a silent dummy WAV is created.
+
+    Args:
+        model_base_dir: The base directory of the SparkTTS model 
+                        (e.g., ./pretrained_models/Spark-TTS-0.5B), which is the parent of BiCodec, wav2vec2 etc.
+        device: The torch device to use for tokenization.
+        sample_audio_path_str: Path to the sample WAV file.
+        target_sample_rate: Sample rate for the dummy audio if it needs to be created.
+        duration_sec: Duration in seconds for the dummy audio if it needs to be created.
+
+    Returns:
+        A tuple (dummy_semantic_tokens, dummy_global_tokens).
+    """
+    print(f"Initializing BiCodecTokenizer from base model dir: {model_base_dir} to get sample token shapes")
+    try:
+        from sparktts.models.audio_tokenizer import BiCodecTokenizer
+        tokenizer = BiCodecTokenizer(model_dir=model_base_dir, device=device)
+    except Exception as e:
+        print(f"✗ Failed to initialize BiCodecTokenizer from {model_base_dir}: {e}")
+        raise
+    
+    sample_audio_path = Path(sample_audio_path_str)
+    if not sample_audio_path.exists():
+        print(f"⚠️ Sample audio {sample_audio_path} not found. Creating a temporary silent dummy WAV file")
+        try:
+            import soundfile as sf
+            dummy_wav_data = np.zeros(target_sample_rate * duration_sec, dtype=np.float32)
+            sample_audio_path.parent.mkdir(parents=True, exist_ok=True)
+            sf.write(sample_audio_path, dummy_wav_data, target_sample_rate)
+            print(f"Dummy silent audio created at {sample_audio_path}")
+        except ImportError:
+            print("✗ `soundfile` library is not installed. Cannot create dummy audio. Please install it or provide a valid sample audio path")
+            raise
+        except Exception as e:
+            print(f"✗ Failed to create dummy audio file at {sample_audio_path}: {e}")
+            raise
+
+    print(f"Tokenizing sample audio: {sample_audio_path} to get token shapes")
+    try:
+        # BiCodecTokenizer.tokenize returns: global_tokens, semantic_tokens
+        real_global_tokens, real_semantic_tokens = tokenizer.tokenize(str(sample_audio_path))
+    except Exception as e:
+        print(f"✗ Failed to tokenize sample audio {sample_audio_path} with BiCodecTokenizer: {e}")
+        raise
+
+    print(f"Shape of real_global_tokens from sample: {real_global_tokens.shape}, dtype: {real_global_tokens.dtype}")
+    print(f"Shape of real_semantic_tokens from sample: {real_semantic_tokens.shape}, dtype: {real_semantic_tokens.dtype}")
+
+    # Create random integer tensors with the same shapes and type as the real tokens.
+    dummy_global_tokens = torch.randint_like(real_global_tokens, low=0, high=100)
+    dummy_semantic_tokens = torch.randint_like(real_semantic_tokens, low=0, high=100)
+    
+    print(f"Shape of created dummy_global_tokens: {dummy_global_tokens.shape}, dtype: {dummy_global_tokens.dtype}")
+    print(f"Shape of created dummy_semantic_tokens: {dummy_semantic_tokens.shape}, dtype: {dummy_semantic_tokens.dtype}")
+
+    return dummy_semantic_tokens, dummy_global_tokens
 
 # Optimization functions
 @torch.no_grad()
@@ -563,13 +687,81 @@ def export_speaker_encoder_tokenizer_to_onnx(model_dir, output_path, device='cpu
     export_device = torch.device(device)
     
     try:
-        # Load models (this would need to be implemented based on SparkTTS structure)
-        # For now, creating a placeholder implementation
-        print("⚠️ Speaker Encoder+Tokenizer export not fully implemented yet")
-        return False
+        # Load the pre-trained BiCodec model to get the SpeakerEncoder
+        bicodec_model_subdir = Path(model_dir) / "BiCodec"
+        print(f"Loading BiCodec model from: {bicodec_model_subdir} to access SpeakerEncoder")
+        if not bicodec_model_subdir.exists():
+            print(f"✗ BiCodec model directory not found at {bicodec_model_subdir}")
+            return False
+        
+        # Load BiCodec model
+        bicodec_model = BiCodec.load_from_checkpoint(model_dir=bicodec_model_subdir, device=export_device)
+        speaker_encoder_module = bicodec_model.speaker_encoder
+        speaker_encoder_module.eval()
+        print("SpeakerEncoder module extracted and set to eval mode")
+        
+        # Create ONNX wrapper
+        onnx_exportable_tokenizer = SpeakerEncoderTokenizerWrapper(speaker_encoder_module).to(export_device)
+        onnx_exportable_tokenizer.eval()
+        
+        # Create dummy Mel input
+        # ECAPA-TDNN expects (B, T, F) where F is feature dimension (e.g., 128 for ECAPA in BiCodec)
+        dummy_mel_batch = 1
+        dummy_mel_time = 200
+        dummy_mel_channels = 128
+        dummy_mels = torch.randn(dummy_mel_batch, dummy_mel_time, dummy_mel_channels, device=export_device).contiguous()
+        print(f"Using dummy_mels input shape (B, T_mel, D_mel_feat): {dummy_mels.shape}")
+        
+        # Test forward pass
+        print("Performing test forward pass...")
+        with torch.no_grad():
+            pytorch_output_tokens = onnx_exportable_tokenizer(dummy_mels)
+        print(f"PyTorch test pass successful. Output tokens shape: {pytorch_output_tokens.shape}")
+        
+        if pytorch_output_tokens.numel() == 0:
+            print("✗ PyTorch wrapper produced empty tokens")
+            return False
+        
+        # Export to ONNX
+        input_names = ["mel_spectrogram"]
+        output_names = ["global_tokens"]
+        
+        dynamic_axes = {
+            input_names[0]: {0: 'batch_size', 1: 'mel_time_steps'},
+            output_names[0]: {0: 'batch_size'}
+        }
+        
+        # Add dynamic axis for token sequence length if needed
+        if pytorch_output_tokens.ndim == 3:  # (B, N_quant_levels, T_quant_tokens)
+            dynamic_axes[output_names[0]][2] = 'token_seq_len'
+        elif pytorch_output_tokens.ndim == 2:  # (B, T_quant_tokens_flat)
+            dynamic_axes[output_names[0]][1] = 'token_seq_len_flat'
+        
+        print(f"Using dynamic axes: {dynamic_axes}")
+        
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
+        torch.onnx.export(
+            onnx_exportable_tokenizer,
+            dummy_mels,
+            output_path,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            opset_version=opset_version,
+            do_constant_folding=True,
+            training=torch.onnx.TrainingMode.EVAL,
+            verbose=False
+        )
+        
+        print(f"Speaker Encoder+Tokenizer exported successfully to {output_path}")
+        return True
         
     except Exception as e:
         print(f"✗ Failed to export Speaker Encoder+Tokenizer: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 def export_bicodec_vocoder_to_onnx(model_dir, output_path, device='cpu', opset_version=14, sample_audio_for_shapes=None, **kwargs):
@@ -589,30 +781,80 @@ def export_bicodec_vocoder_to_onnx(model_dir, output_path, device='cpu', opset_v
             
         bicodec_model = BiCodec.load_from_checkpoint(bicodec_path, device=export_device)
         bicodec_model.eval()
+        print("BiCodec model loaded and set to eval mode")
         
         # Create wrapper
-        vocoder_wrapper = BiCodecVocoderWrapper(bicodec_model.vocoder).to(export_device)
+        vocoder_wrapper = BiCodecVocoderWrapper(bicodec_model).to(export_device)
         vocoder_wrapper.eval()
         
-        # Create dummy input (semantic tokens)
-        dummy_tokens = torch.randint(0, 1000, (1, 8, 49), device=export_device)  # [batch, num_quantizers, seq_len]
+        # Get dummy tokens from sample audio
+        if sample_audio_for_shapes is None:
+            sample_audio_for_shapes = "./example/prompt_audio.wav"
+        
+        print(f"Preparing dummy input tokens using sample audio: {sample_audio_for_shapes}")
+        dummy_semantic_tokens, dummy_global_tokens = get_dummy_tokens_from_sample_audio(
+            model_base_dir=Path(model_dir),
+            device=export_device,
+            sample_audio_path_str=sample_audio_for_shapes
+        )
+        
+        # Ensure tokens are on the correct device
+        dummy_semantic_tokens = dummy_semantic_tokens.to(export_device)
+        dummy_global_tokens = dummy_global_tokens.to(export_device)
+        
+        print(f"Using dummy_semantic_tokens shape: {dummy_semantic_tokens.shape}")
+        print(f"Using dummy_global_tokens shape: {dummy_global_tokens.shape}")
+        
+        # Test forward pass
+        print("Performing test forward pass...")
+        with torch.no_grad():
+            pytorch_output_waveform = vocoder_wrapper(dummy_semantic_tokens, dummy_global_tokens)
+        print(f"PyTorch test pass successful. Output waveform shape: {pytorch_output_waveform.shape}")
+        
+        if pytorch_output_waveform.numel() == 0:
+            print("✗ PyTorch wrapper produced empty waveform")
+            return False
         
         # Export to ONNX
+        input_names = ["semantic_tokens", "global_tokens"]
+        output_names = ["output_waveform"]
+        
+        dynamic_axes = {}
+        
+        # Semantic tokens: (B, T_semantic_flat) or (B, N_quant_semantic, T_semantic)
+        if dummy_semantic_tokens.ndim == 2:
+            dynamic_axes[input_names[0]] = {0: 'batch_size', 1: 'semantic_token_flat_seq_len'}
+        elif dummy_semantic_tokens.ndim == 3:
+            dynamic_axes[input_names[0]] = {0: 'batch_size', 2: 'semantic_token_seq_len'}
+        
+        # Global tokens: (B, N_quant_global, T_global)
+        if dummy_global_tokens.ndim == 3:
+            dynamic_axes[input_names[1]] = {0: 'batch_size', 2: 'global_token_seq_len'}
+        elif dummy_global_tokens.ndim == 2:
+            dynamic_axes[input_names[1]] = {0: 'batch_size', 1: 'global_feature_len'}
+        
+        # Output waveform: (B, 1, AudioSeqLen) or (B, AudioSeqLen)
+        if pytorch_output_waveform.ndim == 3:
+            dynamic_axes[output_names[0]] = {0: 'batch_size', 2: 'audio_sequence_length'}
+        elif pytorch_output_waveform.ndim == 2:
+            dynamic_axes[output_names[0]] = {0: 'batch_size', 1: 'audio_sequence_length'}
+        
+        print(f"Using dynamic axes: {dynamic_axes}")
+        
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
         torch.onnx.export(
             vocoder_wrapper,
-            dummy_tokens,
+            (dummy_semantic_tokens, dummy_global_tokens),
             output_path,
-            input_names=['semantic_tokens'],
-            output_names=['audio_waveform'],
-            dynamic_axes={
-                'semantic_tokens': {2: 'token_sequence_length'},
-                'audio_waveform': {1: 'audio_length'}
-            },
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
             opset_version=opset_version,
             do_constant_folding=True,
-            export_params=True,
             training=torch.onnx.TrainingMode.EVAL,
-            verbose=False,
+            verbose=False
         )
         
         print(f"BiCodec Vocoder exported successfully to {output_path}")
@@ -620,6 +862,8 @@ def export_bicodec_vocoder_to_onnx(model_dir, output_path, device='cpu', opset_v
         
     except Exception as e:
         print(f"✗ Failed to export BiCodec Vocoder: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 def export_llm_to_onnx(model_dir, output_path, device='cpu', opset_version=14, trust_remote_code_llm=False, **kwargs):
