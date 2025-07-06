@@ -1183,7 +1183,7 @@ def main():
     parser = argparse.ArgumentParser(description="Export Spark-TTS models to ONNX")
     parser.add_argument("--base_model_dir", type=Path, default=Path("./pretrained_models/Spark-TTS-0.5B"),
                        help="Path to the base SparkTTS model directory")
-    parser.add_argument("--output_dir", type=Path, default=Path("./onnx_models/Spark-TTS"),
+    parser.add_argument("--output_dir", type=Path, default=Path("./onnx_models/SparkTTS"),
                        help="Output directory for ONNX models")
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda", "cuda:0"],
                        help="Device to use for export")
