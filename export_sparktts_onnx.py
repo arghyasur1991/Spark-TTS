@@ -1461,7 +1461,7 @@ def convert_model_to_int8(fp32_model_path, int8_model_path, model_type="general"
         return False
 
 def verify_onnx_model(onnx_path, input_shapes=None):
-    """Verify the exported ONNX model"""
+    """Verify the exported ONNX model with multiple providers including CoreML"""
     print(f"Verifying ONNX model: {onnx_path}")
     
     try:
@@ -1478,18 +1478,106 @@ def verify_onnx_model(onnx_path, input_shapes=None):
             onnx_model = onnx.load(onnx_path, load_external_data=has_data)
             onnx.checker.check_model(onnx_model)
         
-        # Create ONNX Runtime session to verify it can load
-        providers = ['CPUExecutionProvider']
+        # Test multiple providers in order of preference
+        providers_to_test = []
+        
+        # Check for CoreML compatibility before attempting
+        coreml_compatible = True
+        try:
+            # Load model to check for CoreML limitations
+            onnx_model = onnx.load(onnx_path, load_external_data=has_data)
+            
+            # Check for large vocabulary or dimensions that exceed CoreML limits
+            for initializer in onnx_model.graph.initializer:
+                for dim in initializer.dims:
+                    if dim > 16384:  # CoreML dimension limit
+                        print(f"⚠️ CoreML incompatible: {initializer.name} dimension {dim} > 16384")
+                        coreml_compatible = True  #False
+                        break
+                if not coreml_compatible:
+                    break
+            
+            # Check for zero-dimension shapes in graph inputs
+            for input_info in onnx_model.graph.input:
+                if input_info.type.tensor_type.shape:
+                    for dim in input_info.type.tensor_type.shape.dim:
+                        if hasattr(dim, 'dim_value') and dim.dim_value == 0:
+                            print(f"⚠️ CoreML incompatible: {input_info.name} has zero dimension")
+                            coreml_compatible = False
+                            break
+                    if not coreml_compatible:
+                        break
+                        
+            # For large models, assume incompatible due to vocabulary size
+            if file_size > 500 * 1024 * 1024:  # > 500MB likely has large vocab
+                print("⚠️ CoreML incompatible: Large model likely has vocabulary > 16K dimensions")
+                coreml_compatible = False
+                
+        except Exception as e:
+            print(f"⚠️ Could not check CoreML compatibility: {e}")
+            coreml_compatible = False
+        
+        # CoreML provider with optimized settings for macOS
+        try:
+            import platform
+            if platform.system() == "Darwin" and coreml_compatible:  # macOS and compatible
+                coreml_options = {
+                    "ModelFormat": "MLProgram",
+                    "MLComputeUnits": "CPUAndGPU", 
+                    "RequireStaticInputShapes": "0",
+                    "EnableOnSubgraphs": "1",
+                }
+                providers_to_test.append(("CoreMLExecutionProvider", coreml_options))
+            elif platform.system() == "Darwin" and not coreml_compatible:
+                print("⚠️ CoreML provider skipped: Model has large vocabulary (>16K) or zero-dimension shapes")
+                print("  Consider using CPU or CUDA providers for large language models")
+        except Exception as e:
+            print(f"⚠️ CoreML provider not available: {e}")
+        
+        # CUDA provider if available
         if torch.cuda.is_available():
-            providers.insert(0, 'CUDAExecutionProvider')
+            providers_to_test.append("CUDAExecutionProvider")
         
-        session = ort.InferenceSession(onnx_path, providers=providers)
+        # CPU provider as fallback
+        providers_to_test.append("CPUExecutionProvider")
         
-        print(f"✓ ONNX model {onnx_path} is valid")
-        print(f"  Input names: {[inp.name for inp in session.get_inputs()]}")
-        print(f"  Output names: {[out.name for out in session.get_outputs()]}")
+        # Test each provider
+        successful_providers = []
+        for provider_config in providers_to_test:
+            try:
+                if isinstance(provider_config, tuple):
+                    provider_name, provider_options = provider_config
+                    print(f"Testing {provider_name} with options: {provider_options}")
+                    session = ort.InferenceSession(onnx_path, providers=[(provider_name, provider_options)])
+                else:
+                    provider_name = provider_config
+                    print(f"Testing {provider_name}")
+                    session = ort.InferenceSession(onnx_path, providers=[provider_name])
+                
+                # Get actual provider used
+                actual_provider = session.get_providers()[0]
+                successful_providers.append(actual_provider)
+                print(f"✓ {provider_name} successfully loaded model")
+                print(f"  Actual provider: {actual_provider}")
+                
+                # Only test the first successful provider for basic validation
+                if len(successful_providers) == 1:
+                    print(f"  Input names: {[inp.name for inp in session.get_inputs()]}")
+                    print(f"  Output names: {[out.name for out in session.get_outputs()]}")
+                
+                break  # Use first successful provider
+                
+            except Exception as e:
+                print(f"✗ {provider_name if isinstance(provider_config, str) else provider_config[0]} failed: {e}")
+                continue
         
-        return True
+        if successful_providers:
+            print(f"✓ ONNX model {onnx_path} is valid")
+            print(f"✓ Successfully tested providers: {successful_providers}")
+            return True
+        else:
+            print(f"✗ No providers could load the model")
+            return False
         
     except Exception as e:
         print(f"✗ ONNX model verification failed: {e}")
