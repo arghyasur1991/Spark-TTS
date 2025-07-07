@@ -2,6 +2,28 @@
 """
 Consolidated ONNX Export Script for Spark-TTS Models
 This script exports all Spark-TTS models to ONNX format with multiple precision support and optimizations.
+
+INT8 Quantization Improvements:
+- For LLM models, uses realistic token IDs within vocabulary range instead of zeros
+- Generates multiple calibration samples with diverse token patterns
+- Supports custom calibration texts for better quality
+- Uses model-specific quantization settings (entropy method for LLMs)
+- Applies conservative quantization options for better accuracy
+
+Usage Examples:
+
+Basic export with INT8:
+    python export_sparktts_onnx.py --precision int8 --models llm
+
+Export with custom calibration texts:
+    python export_sparktts_onnx.py --precision int8 --models llm \
+        --calibration_texts "Hello world" "The quick brown fox" "Machine learning is fascinating"
+
+Export with calibration texts from file:
+    python export_sparktts_onnx.py --precision int8 --models llm \
+        --calibration_texts_file calibration_texts.txt
+
+For best INT8 quality, provide representative text samples that match your use case.
 """
 
 import os
@@ -934,7 +956,150 @@ def convert_model_to_fp16(fp32_model_path, fp16_model_path, model_type="general"
         print(f"✗ Failed to convert {fp32_model_path} to FP16: {e}")
         return False
 
-def convert_model_to_int8_static_qdq(fp32_model_path, int8_model_path, model_type="general"):
+def generate_llm_calibration_data_from_text(model_dir, sample_texts=None, max_samples=10, calibration_texts_file=None):
+    """Generate calibration data from real text samples for better LLM quantization"""
+    if not TRANSFORMERS_AVAILABLE:
+        return None
+    
+    try:
+        # Load tokenizer
+        from transformers import AutoTokenizer
+        llm_path = Path(model_dir) / "LLM"
+        tokenizer = AutoTokenizer.from_pretrained(llm_path)
+        
+        # Load calibration texts from file if provided
+        if calibration_texts_file and Path(calibration_texts_file).exists():
+            try:
+                with open(calibration_texts_file, 'r', encoding='utf-8') as f:
+                    sample_texts = [line.strip() for line in f.readlines() if line.strip()]
+                print(f"✓ Loaded {len(sample_texts)} calibration texts from {calibration_texts_file}")
+            except Exception as e:
+                print(f"⚠️ Failed to load calibration texts from file: {e}")
+                sample_texts = None
+        
+        # Create SparkTTS-specific prompts using the actual format
+        if sample_texts is None:
+            # Default texts for TTS
+            base_texts = [
+                "Hello world, how are you today?",
+                "The quick brown fox jumps over the lazy dog.",
+                "Machine learning is transforming our world.",
+                "Welcome to the future of artificial intelligence.",
+                "This is a test of text-to-speech synthesis.",
+                "Natural language processing enables amazing applications.",
+                "Speech technology continues to advance rapidly.",
+                "Voice assistants are becoming more sophisticated.",
+                "Audio generation models produce realistic speech.",
+                "Text synthesis creates human-like voices."
+            ]
+        else:
+            base_texts = sample_texts
+        
+        # Create SparkTTS-formatted prompts
+        sparktts_prompts = []
+        
+        # Task token for TTS (from added_tokens.json: "<|task_tts|>": 165137)
+        task_token = "<|task_tts|>"
+        start_content = "<|start_content|>"
+        end_content = "<|end_content|>"
+        start_global = "<|start_global_token|>"
+        end_global = "<|end_global_token|>"
+        
+        for i, text in enumerate(base_texts[:max_samples]):
+            # Create realistic global tokens (BiCodec tokens typically range 0-4095)
+            # Generate varied token sequences to simulate real audio tokens
+            num_global_tokens = np.random.randint(10, 50)  # Realistic sequence length
+            global_token_ids = np.random.randint(0, 4096, num_global_tokens)
+            global_tokens = "".join([f"<|bicodec_global_{token_id}|>" for token_id in global_token_ids])
+            
+            # Create SparkTTS prompt format
+            # Format: <|task_tts|><|start_content|>TEXT<|end_content|><|start_global_token|>TOKENS<|end_global_token|>
+            prompt = f"{task_token}{start_content}{text}{end_content}{start_global}{global_tokens}{end_global}"
+            sparktts_prompts.append(prompt)
+        
+        print(f"✓ Created {len(sparktts_prompts)} SparkTTS-formatted prompts")
+        print(f"Example prompt length: {len(sparktts_prompts[0])} characters")
+        
+        # Tokenize all prompts
+        calibration_samples = []
+        for i, prompt in enumerate(sparktts_prompts):
+            # Tokenize with appropriate settings for the model
+            tokens = tokenizer(
+                prompt,
+                max_length=512,  # Use larger context length for TTS
+                truncation=True,
+                padding='max_length',
+                return_tensors='np'
+            )
+            
+            # Prepare sample data with all expected inputs
+            sample_data = {}
+            
+            # Main inputs
+            sample_data['input_ids'] = tokens['input_ids'].astype(np.int64)
+            
+            if 'attention_mask' in tokens:
+                sample_data['attention_mask'] = tokens['attention_mask'].astype(np.int64)
+            
+            # Position IDs (sequential positions)
+            seq_len = tokens['input_ids'].shape[1]
+            sample_data['position_ids'] = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
+            
+            # KV cache inputs (initialize as zeros - typical for first inference)
+            # Try to get model config for accurate dimensions
+            try:
+                import json
+                config_path = llm_path / "config.json"
+                if config_path.exists():
+                    with open(config_path, 'r') as f:
+                        config = json.load(f)
+                    num_layers = config.get('num_hidden_layers', 24)
+                    num_attention_heads = config.get('num_attention_heads', 32)
+                    num_key_value_heads = config.get('num_key_value_heads', num_attention_heads)  # GQA support
+                    hidden_size = config.get('hidden_size', 4096)
+                    head_dim = hidden_size // num_attention_heads
+                    print(f"✓ Detected model config: {num_layers} layers, {num_attention_heads} heads, {num_key_value_heads} kv_heads, {head_dim} head_dim")
+                else:
+                    # Fallback values
+                    num_layers = 24
+                    num_attention_heads = 32
+                    num_key_value_heads = 32  # Assume MHA if no config
+                    head_dim = 128
+                    print("⚠️ No config found, using fallback dimensions")
+            except Exception as e:
+                # Fallback values
+                num_layers = 24
+                num_attention_heads = 32
+                num_key_value_heads = 32  # Assume MHA if no config
+                head_dim = 128
+                print(f"⚠️ Failed to read config: {e}, using fallback dimensions")
+            
+            batch_size = 1
+            kv_seq_len = 0   # Empty cache for initial inference (proper sequence alignment)
+            
+            for layer_idx in range(num_layers):
+                # Each layer has key and value caches
+                key_name = f'past_key_values.{layer_idx}.key'
+                value_name = f'past_key_values.{layer_idx}.value'
+                
+                # Shape: [batch_size, num_key_value_heads, seq_len, head_dim]
+                # For GQA models, use num_key_value_heads instead of num_attention_heads
+                # Use proper empty tensors for initial inference
+                sample_data[key_name] = np.zeros((batch_size, num_key_value_heads, kv_seq_len, head_dim), dtype=np.float32)
+                sample_data[value_name] = np.zeros((batch_size, num_key_value_heads, kv_seq_len, head_dim), dtype=np.float32)
+            
+            calibration_samples.append(sample_data)
+            print(f"Generated calibration sample {i+1}/{len(sparktts_prompts)} with {len(sample_data)} inputs")
+        
+        return calibration_samples
+        
+    except Exception as e:
+        print(f"Failed to generate calibration data from text: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def convert_model_to_int8_static_qdq(fp32_model_path, int8_model_path, model_type="general", calibration_texts=None):
     """Convert FP32 ONNX model to INT8 using static quantization with QDQ format"""
     if not INT8_AVAILABLE:
         print(f"Skipping INT8 conversion for {fp32_model_path} - onnxruntime quantization not available")
@@ -943,73 +1108,288 @@ def convert_model_to_int8_static_qdq(fp32_model_path, int8_model_path, model_typ
     try:
         print(f"Converting {fp32_model_path} to INT8 using static QDQ quantization...")
         
-        class DummyCalibrationDataReader(CalibrationDataReader):
-            def __init__(self, model_path):
+        class SmartCalibrationDataReader(CalibrationDataReader):
+            def __init__(self, model_path, model_type="general"):
                 self.model_path = model_path
-                self.data_generated = False
+                self.model_type = model_type
+                self.data_generated = 0
+                self.max_samples = 10  # Generate multiple calibration samples
                 
-                # Load model to get input shapes and types
-                model = onnx.load(model_path)
-                self.input_names = [inp.name for inp in model.graph.input]
-                self.input_shapes = {}
-                self.input_types = {}
+                # Check if we have real calibration data from text samples
+                self.real_calibration_data = calibration_texts
+                if self.real_calibration_data:
+                    print(f"✓ Using {len(self.real_calibration_data)} real calibration samples")
+                    self.max_samples = len(self.real_calibration_data)
+                else:
+                    print("⚠️ No real calibration data available, using synthetic data")
                 
-                for inp in model.graph.input:
-                    # Get shape
-                    shape = []
-                    for dim in inp.type.tensor_type.shape.dim:
-                        if dim.dim_value > 0:
-                            shape.append(dim.dim_value)
-                        else:
-                            # Use realistic defaults for dynamic dimensions
-                            if 'audio' in inp.name.lower():
-                                shape.append(16000)  # 1 second audio
-                            elif 'feature' in inp.name.lower():
-                                shape.append(98)  # Feature sequence length
-                            else:
-                                shape.append(1)  # Default batch size
-                    self.input_shapes[inp.name] = shape
+                # Load model to get input shapes and types (only needed for synthetic data)
+                if not self.real_calibration_data:
+                    model = onnx.load(model_path)
+                    self.input_names = [inp.name for inp in model.graph.input]
+                    self.input_shapes = {}
+                    self.input_types = {}
                     
-                    # Get data type
-                    elem_type = inp.type.tensor_type.elem_type
-                    if elem_type == onnx.TensorProto.FLOAT:
-                        self.input_types[inp.name] = np.float32
-                    elif elem_type == onnx.TensorProto.INT64:
-                        self.input_types[inp.name] = np.int64
-                    elif elem_type == onnx.TensorProto.INT32:
-                        self.input_types[inp.name] = np.int32
-                    else:
-                        self.input_types[inp.name] = np.float32
+                    for inp in model.graph.input:
+                        # Get shape
+                        shape = []
+                        for dim in inp.type.tensor_type.shape.dim:
+                            if dim.dim_value > 0:
+                                shape.append(dim.dim_value)
+                            else:
+                                # Use realistic defaults for dynamic dimensions
+                                if 'audio' in inp.name.lower():
+                                    shape.append(16000)  # 1 second audio
+                                elif 'feature' in inp.name.lower():
+                                    shape.append(98)  # Feature sequence length
+                                elif model_type == "llm":
+                                    # For LLM, use a reasonable sequence length
+                                    shape.append(512)  # Larger context for TTS
+                                else:
+                                    shape.append(1)  # Default batch size
+                        self.input_shapes[inp.name] = shape
+                        
+                        # Get data type
+                        elem_type = inp.type.tensor_type.elem_type
+                        if elem_type == onnx.TensorProto.FLOAT:
+                            self.input_types[inp.name] = np.float32
+                        elif elem_type == onnx.TensorProto.INT64:
+                            self.input_types[inp.name] = np.int64
+                        elif elem_type == onnx.TensorProto.INT32:
+                            self.input_types[inp.name] = np.int32
+                        else:
+                            self.input_types[inp.name] = np.float32
+                    
+                    # Get vocab size for LLM models
+                    if model_type == "llm":
+                        try:
+                            # Try to get vocab size from the model's config
+                            model_dir = Path(model_path).parent
+                            config_path = model_dir / "config.json"
+                            if config_path.exists():
+                                import json
+                                with open(config_path, 'r') as f:
+                                    config = json.load(f)
+                                    self.vocab_size = config.get('vocab_size', 32000)
+                            else:
+                                self.vocab_size = 32000  # Default vocab size for most models
+                        except:
+                            self.vocab_size = 32000
+                        
+                        print(f"Using vocab_size={self.vocab_size} for LLM calibration")
                 
             def get_next(self):
-                if not self.data_generated:
-                    self.data_generated = True
-                    calibration_data = {}
-                    for name, shape in self.input_shapes.items():
-                        dtype = self.input_types[name]
-                        if dtype == np.int64 or dtype == np.int32:
-                            calibration_data[name] = np.zeros(shape, dtype=dtype)
-                        else:
-                            calibration_data[name] = np.random.randn(*shape).astype(dtype)
-                    return calibration_data
-                else:
+                if self.data_generated >= self.max_samples:
                     return None
+                
+                # Use real calibration data if available
+                if self.real_calibration_data:
+                    sample_data = self.real_calibration_data[self.data_generated].copy()  # Make a copy to avoid modifying original
+                    self.data_generated += 1
+                    print(f"Using real calibration sample {self.data_generated}/{self.max_samples}")
+                    
+                    # Robust preprocessing for real calibration data to prevent extreme values
+                    for name, data in sample_data.items():
+                        if data.dtype in [np.float32, np.float16]:
+                            # Handle NaN and infinity values
+                            data_clean = np.nan_to_num(data, nan=0.0, posinf=10.0, neginf=-10.0)
+                            # Clip to very conservative range for entropy method
+                            sample_data[name] = np.clip(data_clean, -3.0, 3.0).astype(data.dtype)
+                        elif data.dtype in [np.int64, np.int32]:
+                            if 'token' in name.lower() or 'input_ids' in name.lower():
+                                # Keep token IDs within reasonable vocab range
+                                sample_data[name] = np.clip(data, 0, 166000).astype(data.dtype)
+                            elif 'position' in name.lower():
+                                # Keep position IDs reasonable
+                                sample_data[name] = np.clip(data, 0, 32768).astype(data.dtype)
+                            elif 'attention_mask' in name.lower():
+                                # Ensure attention mask is 0 or 1
+                                sample_data[name] = np.clip(data, 0, 1).astype(data.dtype)
+                            else:
+                                # General integer bounds
+                                sample_data[name] = np.clip(data, 0, 100000).astype(data.dtype)
+                        
+                        # Final validation to ensure no extreme values remain
+                        if np.any(np.isinf(sample_data[name])) or np.any(np.isnan(sample_data[name])):
+                            print(f"⚠️ Warning: Found inf/nan in {name}, replacing with zeros")
+                            sample_data[name] = np.nan_to_num(sample_data[name], nan=0.0, posinf=1.0, neginf=0.0)
+                    
+                    return sample_data
+                
+                # Fall back to synthetic data generation
+                calibration_data = {}
+                for name, shape in self.input_shapes.items():
+                    dtype = self.input_types[name]
+                    
+                    if dtype == np.int64 or dtype == np.int32:
+                        if self.model_type == "llm":
+                            # Generate realistic token IDs within vocab range
+                            # Create diverse patterns: common tokens, rare tokens, mixed sequences
+                            if self.data_generated == 0:
+                                # First sample: common tokens (lower vocab range)
+                                token_ids = np.random.randint(1, min(1000, self.vocab_size // 4), 
+                                                           size=shape, dtype=dtype)
+                            elif self.data_generated == 1:
+                                # Second sample: mixed range
+                                token_ids = np.random.randint(1, self.vocab_size // 2, 
+                                                           size=shape, dtype=dtype)
+                            elif self.data_generated == 2:
+                                # Third sample: full vocab range
+                                token_ids = np.random.randint(1, self.vocab_size, 
+                                                           size=shape, dtype=dtype)
+                            else:
+                                # Remaining samples: varied patterns
+                                if self.data_generated % 2 == 0:
+                                    # Even samples: focus on common tokens
+                                    token_ids = np.random.randint(1, min(5000, self.vocab_size), 
+                                                               size=shape, dtype=dtype)
+                                else:
+                                    # Odd samples: broader range
+                                    token_ids = np.random.randint(1, self.vocab_size, 
+                                                               size=shape, dtype=dtype)
+                            
+                            # Ensure no zero tokens except potentially at the end (padding)
+                            # Add some realistic patterns
+                            if len(shape) >= 2:  # Batch dimension exists
+                                for batch_idx in range(shape[0]):
+                                    seq_len = shape[1] if len(shape) > 1 else shape[0]
+                                    # Sometimes add padding tokens at the end
+                                    if np.random.random() < 0.3:  # 30% chance
+                                        pad_start = np.random.randint(seq_len // 2, seq_len)
+                                        if len(shape) > 1:
+                                            token_ids[batch_idx, pad_start:] = 0
+                                        else:
+                                            token_ids[pad_start:] = 0
+                            
+                            calibration_data[name] = token_ids
+                        else:
+                            # For non-LLM models, generate appropriate integer values
+                            if 'token' in name.lower():
+                                # Token-like inputs: use reasonable range
+                                calibration_data[name] = np.random.randint(0, 1000, size=shape, dtype=dtype)
+                            else:
+                                # Other integer inputs: use small positive values
+                                calibration_data[name] = np.random.randint(0, 10, size=shape, dtype=dtype)
+                    else:
+                        # Float inputs: generate more realistic distributions
+                        if self.model_type == "llm":
+                            # For LLM embeddings/features: use conservative normal distribution
+                            calibration_data[name] = np.random.normal(0, 0.3, size=shape).astype(dtype)
+                        elif 'audio' in name.lower() or 'wav' in name.lower():
+                            # Audio data: use realistic audio range
+                            calibration_data[name] = np.random.normal(0, 0.1, size=shape).astype(dtype)
+                        elif 'mel' in name.lower() or 'spectrogram' in name.lower():
+                            # Mel spectrogram: use conservative log-scale values
+                            calibration_data[name] = np.clip(np.random.exponential(0.5, size=shape), 0, 5.0).astype(dtype)
+                        else:
+                            # General float inputs: use conservative normal
+                            calibration_data[name] = np.random.normal(0, 0.5, size=shape).astype(dtype)
+                
+                self.data_generated += 1
+                print(f"Generated synthetic calibration sample {self.data_generated}/{self.max_samples}")
+                
+                # Robust clipping to prevent histogram binning issues (same as real data)
+                for name, data in calibration_data.items():
+                    if data.dtype in [np.float32, np.float16]:
+                        # Handle any potential NaN/inf and clip to conservative range
+                        data_clean = np.nan_to_num(data, nan=0.0, posinf=3.0, neginf=-3.0)
+                        calibration_data[name] = np.clip(data_clean, -3.0, 3.0).astype(data.dtype)
+                    elif data.dtype in [np.int64, np.int32]:
+                        # Ensure integer data is within reasonable bounds
+                        if self.model_type == "llm" and 'token' in name.lower():
+                            # Keep token IDs within vocab range
+                            vocab_size = getattr(self, 'vocab_size', 32000)
+                            calibration_data[name] = np.clip(data, 0, vocab_size - 1).astype(data.dtype)
+                        else:
+                            # General integer bounds
+                            calibration_data[name] = np.clip(data, 0, 100000).astype(data.dtype)
+                    
+                    # Final validation for synthetic data too
+                    if np.any(np.isinf(calibration_data[name])) or np.any(np.isnan(calibration_data[name])):
+                        print(f"⚠️ Warning: Found inf/nan in synthetic {name}, replacing with zeros")
+                        calibration_data[name] = np.nan_to_num(calibration_data[name], nan=0.0, posinf=1.0, neginf=0.0)
+                
+                return calibration_data
         
-        calibration_reader = DummyCalibrationDataReader(fp32_model_path)
+        calibration_reader = SmartCalibrationDataReader(fp32_model_path, model_type)
         
         model_size = os.path.getsize(fp32_model_path)
         use_external_data = model_size > 1024 * 1024 * 100  # > 100MB threshold
         
-        quantize_static(
-            model_input=fp32_model_path,
-            model_output=int8_model_path,
-            calibration_data_reader=calibration_reader,
-            quant_format=QuantFormat.QDQ,
-            weight_type=QuantType.QInt8,
-            activation_type=QuantType.QInt8,
-            use_external_data_format=use_external_data,
-            calibrate_method=CalibrationMethod.MinMax
-        )
+        # Use more appropriate quantization settings for LLMs
+        if model_type == "llm":
+            # For LLMs, be more conservative with quantization
+            try:
+                # Try Entropy method first, fall back to MinMax if it fails
+                calibration_method = CalibrationMethod.Entropy
+                try:
+                    quantize_static(
+                        model_input=fp32_model_path,
+                        model_output=int8_model_path,
+                        calibration_data_reader=calibration_reader,
+                        quant_format=QuantFormat.QDQ,
+                        weight_type=QuantType.QInt8,
+                        activation_type=QuantType.QUInt8,  # Use unsigned for activations
+                        use_external_data_format=use_external_data,
+                        calibrate_method=calibration_method,
+                        extra_options={
+                            'WeightSymmetric': True,
+                            'ActivationSymmetric': False,
+                            'EnableSubgraph': False,  # Disable subgraph optimization for LLMs
+                            'ForceQuantizeNoInputCheck': False,
+                            'MatMulConstBOnly': True,  # Only quantize constant B matrix in MatMul
+                        }
+                    )
+                except Exception as entropy_error:
+                    # Check if this is a histogram/calibration issue that MinMax can handle
+                    error_str = str(entropy_error).lower()
+                    histogram_errors = ["bins", "histogram", "range", "overflow", "invalid value"]
+                    is_histogram_error = any(err in error_str for err in histogram_errors)
+                    
+                    if is_histogram_error:
+                        print(f"⚠️ Entropy calibration failed with histogram issue: {entropy_error}")
+                        print("   Falling back to MinMax method which is more robust for this data...")
+                        # Recreate calibration reader since it may have been consumed
+                        calibration_reader = SmartCalibrationDataReader(fp32_model_path, model_type)
+                        quantize_static(
+                            model_input=fp32_model_path,
+                            model_output=int8_model_path,
+                            calibration_data_reader=calibration_reader,
+                            quant_format=QuantFormat.QDQ,
+                            weight_type=QuantType.QInt8,
+                            activation_type=QuantType.QUInt8,
+                            use_external_data_format=use_external_data,
+                            calibrate_method=CalibrationMethod.MinMax,  # More robust fallback
+                            extra_options={
+                                'WeightSymmetric': True,
+                                'ActivationSymmetric': False,
+                                'EnableSubgraph': False,
+                                'ForceQuantizeNoInputCheck': False,
+                                'MatMulConstBOnly': True,
+                            }
+                        )
+                    else:
+                        # For other errors (shape mismatches, etc.), let the outer handler deal with it
+                        raise entropy_error
+            except Exception as e:
+                if "broadcast" in str(e).lower() or "shape" in str(e).lower():
+                    print(f"⚠️ Shape mismatch in static quantization: {e}")
+                    print("This is often due to KV cache dimension mismatches. Will fall back to dynamic quantization.")
+                    raise e  # Re-raise to trigger fallback
+                else:
+                    raise e
+        else:
+            # For other models, use standard settings
+            quantize_static(
+                model_input=fp32_model_path,
+                model_output=int8_model_path,
+                calibration_data_reader=calibration_reader,
+                quant_format=QuantFormat.QDQ,
+                weight_type=QuantType.QInt8,
+                activation_type=QuantType.QInt8,
+                use_external_data_format=use_external_data,
+                calibrate_method=CalibrationMethod.MinMax
+            )
         
         print(f"✓ INT8 QDQ model saved to {int8_model_path}")
         return True
@@ -1018,15 +1398,32 @@ def convert_model_to_int8_static_qdq(fp32_model_path, int8_model_path, model_typ
         print(f"✗ Failed to convert {fp32_model_path} to INT8 QDQ: {e}")
         return False
 
-def convert_model_to_int8(fp32_model_path, int8_model_path, model_type="general"):
+def convert_model_to_int8(fp32_model_path, int8_model_path, model_type="general", model_dir=None):
     """Convert FP32 ONNX model to INT8"""
     if not INT8_AVAILABLE:
         print(f"Skipping INT8 conversion for {fp32_model_path} - onnxruntime quantization not available")
         return False
     
     try:
+        # For LLMs, try to generate better calibration data from text
+        calibration_texts = None
+        if model_type == "llm" and model_dir:
+            print("Attempting to generate realistic calibration data from text samples...")
+            # Use custom calibration texts if provided, otherwise use defaults
+            custom_texts = getattr(convert_model_to_int8, '_custom_calibration_texts', None)
+            custom_texts_file = getattr(convert_model_to_int8, '_custom_calibration_texts_file', None)
+            calibration_texts = generate_llm_calibration_data_from_text(
+                model_dir, 
+                sample_texts=custom_texts, 
+                calibration_texts_file=custom_texts_file
+            )
+            if calibration_texts:
+                print(f"✓ Generated {len(calibration_texts)} calibration samples from text")
+            else:
+                print("⚠️ Failed to generate text-based calibration data, using synthetic data")
+        
         # Try static QDQ quantization first
-        if convert_model_to_int8_static_qdq(fp32_model_path, int8_model_path, model_type):
+        if convert_model_to_int8_static_qdq(fp32_model_path, int8_model_path, model_type, calibration_texts):
             return True
         
         print(f"Static QDQ quantization failed, trying dynamic quantization...")
@@ -1035,12 +1432,26 @@ def convert_model_to_int8(fp32_model_path, int8_model_path, model_type="general"
         model_size = os.path.getsize(fp32_model_path)
         use_external_data = model_size > 1024 * 1024 * 100
         
-        quantize_dynamic(
-            model_input=fp32_model_path,
-            model_output=int8_model_path,
-            weight_type=QuantType.QInt8,
-            use_external_data_format=use_external_data
-        )
+        # For LLMs, use more conservative dynamic quantization
+        if model_type == "llm":
+            print("Using conservative dynamic quantization for LLM...")
+            quantize_dynamic(
+                model_input=fp32_model_path,
+                model_output=int8_model_path,
+                weight_type=QuantType.QInt8,
+                use_external_data_format=use_external_data,
+                extra_options={
+                    'MatMulConstBOnly': True,  # Only quantize constant B matrix in MatMul
+                    'WeightSymmetric': True,
+                }
+            )
+        else:
+            quantize_dynamic(
+                model_input=fp32_model_path,
+                model_output=int8_model_path,
+                weight_type=QuantType.QInt8,
+                use_external_data_format=use_external_data
+            )
         
         print(f"✓ INT8 model saved to {int8_model_path}")
         return True
@@ -1125,6 +1536,7 @@ def export_model_with_precisions(export_func, model_dir, base_path, model_name, 
     success_count = 0
     base_path_str = str(base_path)
     model_type = model_name.lower().replace(" ", "_")
+    model_type = "llm" if model_type == "model" else model_type
     
     # Create precision-specific paths
     fp32_path = base_path_str
@@ -1154,7 +1566,7 @@ def export_model_with_precisions(export_func, model_dir, base_path, model_name, 
                     
                     # Convert to INT8 if requested
                     if export_int8:
-                        if convert_model_to_int8(fp32_path, int8_path, model_type):
+                        if convert_model_to_int8(fp32_path, int8_path, model_type, model_dir):
                             if verify_onnx_model(int8_path):
                                 success_count += 1
                                 print(f"✓ {model_name} INT8 quantization successful")
@@ -1191,7 +1603,7 @@ def main():
                        choices=["wav2vec2", "mel_spectrogram", "bicodec_encoder_quantizer", 
                                "speaker_encoder_tokenizer", "bicodec_vocoder", "llm", "all"],
                        default=["all"], help="Models to export")
-    parser.add_argument("--opset_version", type=int, default=14,
+    parser.add_argument("--opset_version", type=int, default=18,
                        help="ONNX opset version to use")
     parser.add_argument("--precision", choices=["all", "fp32", "fp16", "floating", "int8"], 
                        default="floating", help="Precision to export")
@@ -1203,6 +1615,10 @@ def main():
                        help="Sample audio for vocoder export")
     parser.add_argument("--clean", action="store_true",
                        help="Clean output directory before export")
+    parser.add_argument("--calibration_texts", type=str, nargs="+",
+                       help="Custom text samples for LLM INT8 calibration (improves quality)")
+    parser.add_argument("--calibration_texts_file", type=str,
+                       help="Path to file containing calibration texts (one per line)")
     
     args = parser.parse_args()
     
@@ -1214,6 +1630,19 @@ def main():
     if args.precision in ["all", "int8"] and not INT8_AVAILABLE:
         print("⚠️ INT8 quantization requested but onnxruntime quantization not available")
         export_int8 = False
+    
+    # Set calibration texts for INT8 quantization
+    if export_int8:
+        # Store calibration texts in the function for access during quantization
+        convert_model_to_int8._custom_calibration_texts = args.calibration_texts
+        convert_model_to_int8._custom_calibration_texts_file = args.calibration_texts_file
+        
+        if args.calibration_texts:
+            print(f"📝 Using {len(args.calibration_texts)} custom calibration texts for INT8 quantization")
+        elif args.calibration_texts_file:
+            print(f"📝 Using calibration texts from file: {args.calibration_texts_file}")
+        else:
+            print("📝 Using default calibration texts for INT8 quantization")
     
     # Print configuration
     precisions = []

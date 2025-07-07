@@ -30,6 +30,7 @@ MANIFEST
 webui_test.py
 onnx_models_exported/
 onnx_models/
+llm_test/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
