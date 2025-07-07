@@ -906,16 +906,27 @@ def export_llm_to_onnx(model_dir, output_path, device='cpu', opset_version=14, t
         return False
     
     try:
+        # Prepare arguments for main_export
+        export_args = {
+            "model_name_or_path": str(llm_path),
+            "output": output_dir,
+            "task": "text-generation-with-past",
+            "opset": opset_version,
+            "device": device,
+            "fp16": output_path.endswith("fp16.onnx"),
+            "trust_remote_code": trust_remote_code_llm,
+        }
+
+        # Add static shape arguments if provided
+        batch_size = kwargs.get("batch_size")
+        sequence_length = kwargs.get("sequence_length")
+        if batch_size is not None and sequence_length is not None:
+            print(f"Using static shapes for LLM export: batch_size={batch_size}, sequence_length={sequence_length}")
+            export_args["batch_size"] = batch_size
+            export_args["sequence_length"] = sequence_length
+
         # Use Optimum to export LLM
-        main_export(
-            model_name_or_path=str(llm_path),
-            output=output_dir,
-            task="text-generation-with-past",
-            opset=opset_version,
-            device=device,
-            fp16=output_path.endswith("fp16.onnx"),
-            trust_remote_code=trust_remote_code_llm,
-        )
+        main_export(**export_args)
 
         print(f"LLM exported successfully to {output_dir}")
         return True
@@ -1483,39 +1494,6 @@ def verify_onnx_model(onnx_path, input_shapes=None):
         
         # Check for CoreML compatibility before attempting
         coreml_compatible = True
-        try:
-            # Load model to check for CoreML limitations
-            onnx_model = onnx.load(onnx_path, load_external_data=has_data)
-            
-            # Check for large vocabulary or dimensions that exceed CoreML limits
-            for initializer in onnx_model.graph.initializer:
-                for dim in initializer.dims:
-                    if dim > 16384:  # CoreML dimension limit
-                        print(f"⚠️ CoreML incompatible: {initializer.name} dimension {dim} > 16384")
-                        coreml_compatible = True  #False
-                        break
-                if not coreml_compatible:
-                    break
-            
-            # Check for zero-dimension shapes in graph inputs
-            for input_info in onnx_model.graph.input:
-                if input_info.type.tensor_type.shape:
-                    for dim in input_info.type.tensor_type.shape.dim:
-                        if hasattr(dim, 'dim_value') and dim.dim_value == 0:
-                            print(f"⚠️ CoreML incompatible: {input_info.name} has zero dimension")
-                            coreml_compatible = False
-                            break
-                    if not coreml_compatible:
-                        break
-                        
-            # For large models, assume incompatible due to vocabulary size
-            if file_size > 500 * 1024 * 1024:  # > 500MB likely has large vocab
-                print("⚠️ CoreML incompatible: Large model likely has vocabulary > 16K dimensions")
-                coreml_compatible = False
-                
-        except Exception as e:
-            print(f"⚠️ Could not check CoreML compatibility: {e}")
-            coreml_compatible = False
         
         # CoreML provider with optimized settings for macOS
         try:
@@ -1699,6 +1677,10 @@ def main():
                        help="Export LLM in FP16 precision")
     parser.add_argument("--trust_remote_code_llm", action="store_true",
                        help="Trust remote code for LLM export")
+    parser.add_argument("--llm_static_batch_size", type=int, default=None,
+                       help="Static batch size for LLM export. If not set, uses dynamic axes.")
+    parser.add_argument("--llm_static_sequence_length", type=int, default=None,
+                       help="Static sequence length for LLM export. If not set, uses dynamic axes.")
     parser.add_argument("--sample_audio_for_vocoder", type=str, default="./example/prompt_audio.wav",
                        help="Sample audio for vocoder export")
     parser.add_argument("--clean", action="store_true",
@@ -1799,17 +1781,15 @@ def main():
             model_info = model_mappings[model_name]
             output_path = output_dir / model_info["path"]
             
+            kwargs = {}
             # Special handling for LLM
             if model_name == "llm":
-                kwargs = {
-                    "trust_remote_code_llm": args.trust_remote_code_llm
-                }
+                kwargs["trust_remote_code_llm"] = args.trust_remote_code_llm
+                if args.llm_static_batch_size is not None and args.llm_static_sequence_length is not None:
+                    kwargs["batch_size"] = args.llm_static_batch_size
+                    kwargs["sequence_length"] = args.llm_static_sequence_length
             elif model_name == "bicodec_vocoder":
-                kwargs = {
-                    "sample_audio_for_shapes": args.sample_audio_for_vocoder
-                }
-            else:
-                kwargs = {}
+                kwargs["sample_audio_for_shapes"] = args.sample_audio_for_vocoder
             
             try:
                 success_count += export_model_with_precisions(
