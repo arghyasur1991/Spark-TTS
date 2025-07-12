@@ -3,7 +3,7 @@
     Spark-TTS
     </h1>
     <p>
-    Official PyTorch code for inference of <br>
+    Fork of Official PyTorch code for inference of <br>
     <b><em>Spark-TTS: An Efficient LLM-Based Text-to-Speech Model with Single-Stream Decoupled Speech Tokens</em></b>
     </p>
     <p>
