@@ -52,37 +52,37 @@ This project includes a script to export all necessary components of Spark-TTS t
 
 ### Running the Export Script
 
-The main script to orchestrate all ONNX exports is `export_all_sparktts_onnx.py`.
+The main script to orchestrate all ONNX exports is `export_sparktts_onnx.py`.
 
 You can run the script with default settings:
 ```sh
-python export_all_sparktts_onnx.py
+python export_sparktts_onnx.py
 ```
 
 This will:
 -   Use `./pretrained_models/Spark-TTS-0.5B` as the source for an LFS-downloaded model.
--   Output the exported ONNX models to a structured directory within `./onnx_models_exported/SparkTTS/`.
--   Default to CPU for export and use ONNX opset version 14 (unless overridden by specific component export scripts).
+-   Output the exported ONNX models to a structured directory within `./onnx_models/SparkTTS/`.
+-   Default to CPU for export and use ONNX opset version 18 (unless overridden by specific component export scripts).
 
 **Customization Options:**
 
 The script offers several command-line arguments for customization:
 
 *   `--base_model_dir`: Specify the path to your downloaded Spark-TTS model directory (default: `./pretrained_models/Spark-TTS-0.5B`).
-*   `--output_base_dir`: Define the root directory where the final ONNX model structure will be saved (default: `./onnx_models_exported`).
+*   `--output_dir`: Define the root directory where the final ONNX model structure will be saved (default: `./onnx_models`).
 *   `--opset_version`: Set a global ONNX opset version for the export scripts (default: 14). Some individual scripts might have their own specific opset versions.
-*   `--device`: Choose the device for export (e.g., `cpu`, `cuda`, `cuda:0`; default: `cpu`).
-*   `--fp16_llm`: Add this flag to export the main LLM component in FP16 precision.
-*   `--sample_audio_for_vocoder`: Provide a path to a sample WAV file used to determine token shapes for the BiCodec Vocoder's dummy inputs (default: `./example/prompt_audio.wav`).
+*   `--models`: Choose the models for export (e.g., `wav2vec2`, `mel_spectrogram`, `bicodec_encoder_quantizer`, 
+                               `speaker_encoder_tokenizer`, `bicodec_vocoder`, `llm`, `all`; default: `all`).
+*   `--precision`: Choose the precision (`all`, `fp32`, `fp16`, `floating` (both fp16 and fp32), `int8`; default: `floating`)
 
 Example with custom arguments:
 ```sh
-python export_all_sparktts_onnx.py \
+python export_sparktts_onnx.py \
     --base_model_dir /path/to/your/Spark-TTS-0.5B \
-    --output_base_dir ./my_onnx_exports \
+    --output_dir ./my_onnx_exports \
     --opset_version 17 \
-    --device cuda:0 \
-    --fp16_llm
+    --models llm \
+    --precision fp32
 ```
 
 The script will execute individual export scripts for each component (Wav2Vec2, Mel Spectrogram, BiCodec Encoder/Quantizer, Speaker Encoder Tokenizer, BiCodec Vocoder, and the main LLM) and organize them into the specified output directory.
