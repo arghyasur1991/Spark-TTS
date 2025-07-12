@@ -888,6 +888,24 @@ def export_bicodec_vocoder_to_onnx(model_dir, output_path, device='cpu', opset_v
         traceback.print_exc()
         return False
 
+def remove_initializer_from_input(model):
+    if model.ir_version < 4:
+        print(
+            'Model with ir_version below 4 requires to include initilizer in graph input'
+        )
+        return
+
+    inputs = model.graph.input
+    name_to_input = {}
+    for input in inputs:
+        name_to_input[input.name] = input
+
+    for initializer in model.graph.initializer:
+        if initializer.name in name_to_input:
+            inputs.remove(name_to_input[initializer.name])
+
+    return model
+
 def export_llm_to_onnx(model_dir, output_path, device='cpu', opset_version=14, trust_remote_code_llm=False, **kwargs):
     """Export LLM to ONNX format using Optimum"""
     print(f"Exporting LLM to {output_path} with opset {opset_version}")
@@ -928,6 +946,24 @@ def export_llm_to_onnx(model_dir, output_path, device='cpu', opset_version=14, t
         # Use Optimum to export LLM
         main_export(**export_args)
 
+        remove_initializer = False
+        if remove_initializer:
+            # Remove initializer from input
+            model = onnx.load(output_dir / "model.onnx", load_external_data=True)
+            model = remove_initializer_from_input(model)
+            external_data_file = output_dir / "model.onnx_data"
+            print(f"External data file: {external_data_file}")
+            if external_data_file.exists():
+                os.remove(external_data_file)
+
+            onnx.save_model(
+                model,
+                output_dir / "model.onnx",
+                save_as_external_data=True,
+                all_tensors_to_one_file=True,
+                location="model.onnx_data",
+                convert_attribute=False,
+            )
         print(f"LLM exported successfully to {output_dir}")
         return True
         
